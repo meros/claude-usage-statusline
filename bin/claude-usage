@@ -172,9 +172,9 @@ cmd_install_hook() {
         echo '{}' > "$settings_file"
     fi
 
-    # Use jq to set the statusLine.command
+    # Use jq to set the statusLine type and command
     local tmp="${settings_file}.tmp"
-    if jq --arg cmd "$cmd statusline" '.statusLine.command = $cmd' "$settings_file" > "$tmp"; then
+    if jq --arg cmd "$cmd statusline" '.statusLine.type = "command" | .statusLine.command = $cmd' "$settings_file" > "$tmp"; then
         mv "$tmp" "$settings_file"
     else
         rm -f "$tmp"
