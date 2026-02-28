@@ -13,18 +13,41 @@ cu_cache_is_fresh() {
     [ "$cache_age" -lt "$CU_CACHE_MAX_AGE" ]
 }
 
+cu_resolve_token() {
+    local token=""
+
+    # 1. Try credentials JSON file (Linux default, or macOS manual export)
+    local cred_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+    token=$(jq -r '.claudeAiOauth.accessToken // empty' "$cred_file" 2>/dev/null)
+    if [ -n "$token" ]; then
+        echo "$token"
+        return 0
+    fi
+
+    # 2. Try macOS Keychain (Claude Code stores creds here on macOS)
+    if command -v security >/dev/null 2>&1; then
+        local keychain_data
+        keychain_data=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || true
+        if [ -n "$keychain_data" ]; then
+            token=$(echo "$keychain_data" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+            if [ -n "$token" ]; then
+                echo "$token"
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
 cu_fetch() {
     local force="${1:-}"
     if [ "$force" != "force" ] && cu_cache_is_fresh; then
         return 0
     fi
 
-    local cred_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
     local token
-    token=$(jq -r '.claudeAiOauth.accessToken // empty' "$cred_file" 2>/dev/null)
-    if [ -z "$token" ]; then
-        return 1
-    fi
+    token=$(cu_resolve_token) || return 1
 
     local resp
     resp=$(curl -s --max-time 5 \

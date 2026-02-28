@@ -17,6 +17,13 @@ export CU_NOW=1709100000
 export HOME="$TEST_DIR/home"
 mkdir -p "$HOME"
 
+# Remove any real `security` command from PATH so it doesn't interfere
+# We'll add a mock when testing the Keychain fallback
+CLEAN_PATH=$(echo "$PATH" | tr ':' '\n' | grep -v "^$" | while read -r p; do
+    [ -x "$p/security" ] || printf '%s:' "$p"
+done)
+CLEAN_PATH="${CLEAN_PATH%:}"
+
 source "${SCRIPT_DIR}/../lib/util.sh"
 source "${SCRIPT_DIR}/../lib/fetch.sh"
 
@@ -36,21 +43,16 @@ assert_eq() {
 
 echo "=== Credential Resolution Tests ==="
 
-# Test 1: No credentials file -> cu_fetch fails
+# Test 1: No credentials file -> cu_resolve_token fails
 unset CLAUDE_CONFIG_DIR 2>/dev/null || true
-cu_fetch "force" && result=0 || result=$?
+PATH="$CLEAN_PATH" cu_resolve_token >/dev/null && result=0 || result=$?
 assert_eq "missing credentials file returns failure" "1" "$result"
 
 # Test 2: Default path (~/.claude/.credentials.json)
 mkdir -p "$HOME/.claude"
 echo '{"claudeAiOauth":{"accessToken":"test-token-default"}}' > "$HOME/.claude/.credentials.json"
-# cu_fetch will fail on the curl call (no real API), but we can verify the token is read
-# by checking it gets past the token-empty check (curl will fail, returning 1 from response validation)
 unset CLAUDE_CONFIG_DIR 2>/dev/null || true
-cu_fetch "force" && result=0 || result=$?
-# Returns 1 because curl can't reach the API, but importantly it did NOT return 1 at the token check
-# We need a more precise test - let's extract the token directly
-token=$(jq -r '.claudeAiOauth.accessToken // empty' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json" 2>/dev/null)
+token=$(cu_resolve_token)
 assert_eq "default path reads token" "test-token-default" "$token"
 
 # Test 3: CLAUDE_CONFIG_DIR override
@@ -58,44 +60,118 @@ custom_dir="$TEST_DIR/custom-claude-config"
 mkdir -p "$custom_dir"
 echo '{"claudeAiOauth":{"accessToken":"test-token-custom"}}' > "$custom_dir/.credentials.json"
 export CLAUDE_CONFIG_DIR="$custom_dir"
-token=$(jq -r '.claudeAiOauth.accessToken // empty' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json" 2>/dev/null)
+token=$(cu_resolve_token)
 assert_eq "CLAUDE_CONFIG_DIR override reads token" "test-token-custom" "$token"
 
-# Test 4: CLAUDE_CONFIG_DIR set but credentials file missing
+# Test 4: CLAUDE_CONFIG_DIR set but credentials file missing (no keychain either)
 empty_dir="$TEST_DIR/empty-config"
 mkdir -p "$empty_dir"
 export CLAUDE_CONFIG_DIR="$empty_dir"
-cu_fetch "force" && result=0 || result=$?
+PATH="$CLEAN_PATH" cu_resolve_token >/dev/null && result=0 || result=$?
 assert_eq "CLAUDE_CONFIG_DIR with missing creds returns failure" "1" "$result"
 
 # Test 5: CLAUDE_CONFIG_DIR takes priority over default
-# Put different tokens in both locations
 mkdir -p "$HOME/.claude"
 echo '{"claudeAiOauth":{"accessToken":"default-token"}}' > "$HOME/.claude/.credentials.json"
 priority_dir="$TEST_DIR/priority-config"
 mkdir -p "$priority_dir"
 echo '{"claudeAiOauth":{"accessToken":"priority-token"}}' > "$priority_dir/.credentials.json"
 export CLAUDE_CONFIG_DIR="$priority_dir"
-token=$(jq -r '.claudeAiOauth.accessToken // empty' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json" 2>/dev/null)
+token=$(cu_resolve_token)
 assert_eq "CLAUDE_CONFIG_DIR takes priority over default" "priority-token" "$token"
 
 # Test 6: Empty token in credentials file
 unset CLAUDE_CONFIG_DIR 2>/dev/null || true
 echo '{"claudeAiOauth":{"accessToken":""}}' > "$HOME/.claude/.credentials.json"
-cu_fetch "force" && result=0 || result=$?
+PATH="$CLEAN_PATH" cu_resolve_token >/dev/null && result=0 || result=$?
 assert_eq "empty token returns failure" "1" "$result"
 
 # Test 7: Malformed credentials JSON
 unset CLAUDE_CONFIG_DIR 2>/dev/null || true
 echo 'not valid json' > "$HOME/.claude/.credentials.json"
-cu_fetch "force" && result=0 || result=$?
+PATH="$CLEAN_PATH" cu_resolve_token >/dev/null && result=0 || result=$?
 assert_eq "malformed credentials returns failure" "1" "$result"
 
 # Test 8: Missing accessToken key
 unset CLAUDE_CONFIG_DIR 2>/dev/null || true
 echo '{"claudeAiOauth":{"refreshToken":"some-refresh"}}' > "$HOME/.claude/.credentials.json"
-cu_fetch "force" && result=0 || result=$?
+PATH="$CLEAN_PATH" cu_resolve_token >/dev/null && result=0 || result=$?
 assert_eq "missing accessToken key returns failure" "1" "$result"
+
+echo ""
+echo "=== macOS Keychain Fallback Tests ==="
+
+# Create a mock `security` command that simulates macOS Keychain
+MOCK_BIN="$TEST_DIR/mock-bin"
+mkdir -p "$MOCK_BIN"
+
+# Test 9: Keychain fallback when no credentials file exists
+rm -f "$HOME/.claude/.credentials.json"
+unset CLAUDE_CONFIG_DIR 2>/dev/null || true
+cat > "$MOCK_BIN/security" << 'MOCK'
+#!/usr/bin/env bash
+# Mock macOS security command
+if [ "$1" = "find-generic-password" ] && [ "$3" = "Claude Code-credentials" ] && [ "$4" = "-w" ]; then
+    echo '{"claudeAiOauth":{"accessToken":"keychain-token-abc"}}'
+    exit 0
+fi
+exit 1
+MOCK
+chmod +x "$MOCK_BIN/security"
+token=$(PATH="$MOCK_BIN:$CLEAN_PATH" cu_resolve_token)
+assert_eq "keychain fallback reads token" "keychain-token-abc" "$token"
+
+# Test 10: Credentials file takes priority over keychain
+mkdir -p "$HOME/.claude"
+echo '{"claudeAiOauth":{"accessToken":"file-token"}}' > "$HOME/.claude/.credentials.json"
+unset CLAUDE_CONFIG_DIR 2>/dev/null || true
+token=$(PATH="$MOCK_BIN:$CLEAN_PATH" cu_resolve_token)
+assert_eq "credentials file takes priority over keychain" "file-token" "$token"
+
+# Test 11: Keychain with empty accessToken returns failure
+rm -f "$HOME/.claude/.credentials.json"
+unset CLAUDE_CONFIG_DIR 2>/dev/null || true
+cat > "$MOCK_BIN/security" << 'MOCK'
+#!/usr/bin/env bash
+if [ "$1" = "find-generic-password" ] && [ "$3" = "Claude Code-credentials" ] && [ "$4" = "-w" ]; then
+    echo '{"claudeAiOauth":{"accessToken":""}}'
+    exit 0
+fi
+exit 1
+MOCK
+chmod +x "$MOCK_BIN/security"
+PATH="$MOCK_BIN:$CLEAN_PATH" cu_resolve_token >/dev/null && result=0 || result=$?
+assert_eq "keychain with empty token returns failure" "1" "$result"
+
+# Test 12: Keychain with malformed JSON returns failure
+cat > "$MOCK_BIN/security" << 'MOCK'
+#!/usr/bin/env bash
+if [ "$1" = "find-generic-password" ] && [ "$3" = "Claude Code-credentials" ] && [ "$4" = "-w" ]; then
+    echo 'not valid json'
+    exit 0
+fi
+exit 1
+MOCK
+chmod +x "$MOCK_BIN/security"
+PATH="$MOCK_BIN:$CLEAN_PATH" cu_resolve_token >/dev/null && result=0 || result=$?
+assert_eq "keychain with malformed JSON returns failure" "1" "$result"
+
+# Test 13: Keychain command fails (item not found) -> overall failure
+rm -f "$HOME/.claude/.credentials.json"
+unset CLAUDE_CONFIG_DIR 2>/dev/null || true
+cat > "$MOCK_BIN/security" << 'MOCK'
+#!/usr/bin/env bash
+exit 1
+MOCK
+chmod +x "$MOCK_BIN/security"
+PATH="$MOCK_BIN:$CLEAN_PATH" cu_resolve_token >/dev/null && result=0 || result=$?
+assert_eq "keychain lookup failure returns failure" "1" "$result"
+
+# Test 14: No security command and no credentials file -> failure
+rm -f "$HOME/.claude/.credentials.json"
+unset CLAUDE_CONFIG_DIR 2>/dev/null || true
+PATH="$CLEAN_PATH" cu_resolve_token >/dev/null && result=0 || result=$?
+assert_eq "no security command and no creds file returns failure" "1" "$result"
 
 echo ""
 printf "Results: %d passed, %d failed\n" "$PASS" "$FAIL"
