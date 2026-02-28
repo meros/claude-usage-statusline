@@ -41,6 +41,11 @@ CU_OPT_HOURS=""
 CU_OPT_BRAILLE=""
 CU_OPT_MULTILINE=""
 
+# ETA defaults (configurable via env vars)
+CU_ETA_WINDOWS="${CU_ETA_WINDOWS:-five_hour,seven_day}"
+CU_ETA_5H_AVG="${CU_ETA_5H_AVG:-3}"
+CU_ETA_7D_AVG="${CU_ETA_7D_AVG:-24}"
+
 parse_flags() {
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -76,6 +81,10 @@ parse_flags() {
                 ;;
             --multiline)
                 CU_OPT_MULTILINE=1
+                ;;
+            --eta-windows)
+                shift
+                CU_ETA_WINDOWS="$1"
                 ;;
             *)
                 echo "Unknown flag: $1" >&2
@@ -124,19 +133,31 @@ cmd_eta() {
         cache_data=$(cu_read_cache)
         [ -n "$cache_data" ] && cu_history_record "$cache_data"
     fi
-    local eta_info
-    eta_info=$(cu_eta_projection "seven_day" "${CU_OPT_HOURS:-48}" 2>/dev/null || true)
-    if [ -n "$eta_info" ]; then
-        local rate eta_hours eta_secs before_reset
-        read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-        local eta_dur
-        eta_dur=$(cu_fmt_duration "${eta_secs:-0}")
-        printf "Rate: +%s%%/hour\n" "${rate:-0}"
-        printf "ETA to 100%%: ~%s\n" "$eta_dur"
-        [ "${before_reset:-}" = "1" ] && printf "%sWARNING: Projected to hit limit BEFORE reset%s\n" "$(cu_color "$CU_RED")" "$(cu_reset)"
-    else
-        echo "Insufficient history data for projection."
-    fi
+    local any_output=""
+    local _eta_win
+    for _eta_win in ${CU_ETA_WINDOWS//,/ }; do
+        local _eta_field="" _eta_avg="" _eta_label=""
+        case "$_eta_win" in
+            five_hour) _eta_field="five_hour"; _eta_avg="${CU_ETA_5H_AVG:-3}"; _eta_label="5-Hour Window" ;;
+            seven_day) _eta_field="seven_day"; _eta_avg="${CU_ETA_7D_AVG:-24}"; _eta_label="7-Day Window" ;;
+            *) continue ;;
+        esac
+        local eta_info
+        eta_info=$(cu_eta_projection "$_eta_field" "$_eta_avg" 2>/dev/null || true)
+        if [ -n "$eta_info" ]; then
+            local rate eta_hours eta_secs before_reset
+            read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+            local eta_dur
+            eta_dur=$(cu_fmt_duration "${eta_secs:-0}")
+            [ -n "$any_output" ] && printf "\n"
+            printf "%s\n" "$_eta_label"
+            printf "  Rate: +%s%%/hour\n" "${rate:-0}"
+            printf "  ETA to 100%%: ~%s\n" "$eta_dur"
+            [ "${before_reset:-}" = "1" ] && printf "  %sWARNING: Projected to hit limit BEFORE reset%s\n" "$(cu_color "$CU_RED")" "$(cu_reset)"
+            any_output=1
+        fi
+    done
+    [ -z "$any_output" ] && echo "Insufficient history data for projection."
 }
 
 cmd_fetch() {
@@ -211,6 +232,12 @@ Flags:
   --hours N     History window in hours
   --braille     Use compact Braille sparkline (2 data points per char)
   --multiline   Multi-line statusline (progress bars + sparkline)
+  --eta-windows Comma-separated ETA windows: five_hour,seven_day (default: both)
+
+Environment:
+  CU_ETA_WINDOWS  ETA windows to show (default: five_hour,seven_day)
+  CU_ETA_5H_AVG   Moving avg window for 5h ETA in hours (default: 3)
+  CU_ETA_7D_AVG   Moving avg window for 7d ETA in hours (default: 24)
 EOF
 }
 

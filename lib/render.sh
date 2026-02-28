@@ -85,40 +85,59 @@ cu_fmt_pct() {
 }
 
 cu_eta_projection() {
-    # Calculate ETA to 100% based on history trend
-    local field="${1:-seven_day}" hours="${2:-48}"
+    # Calculate ETA to 100% using moving average of positive hourly deltas
+    # Args: field (five_hour|seven_day), avg_window (number of recent positive deltas to average)
+    local field="${1:-seven_day}" avg_window="${2:-24}"
     local values=()
     local timestamps=()
 
+    # Read enough history to cover the averaging window
+    local read_hours=$((avg_window + 1))
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         local ts val
         ts=$(echo "$line" | jq -r '.ts' 2>/dev/null)
         val=$(echo "$line" | jq -r ".$field.util" 2>/dev/null)
         [ -n "$ts" ] && [ -n "$val" ] && timestamps+=("$ts") && values+=("$val")
-    done < <(cu_history_read "$hours")
+    done < <(cu_history_read "$read_hours")
 
     local n=${#values[@]}
     [ "$n" -lt 2 ] && return 1
 
-    # Simple linear regression: rate of change per hour
-    local first_val="${values[0]}"
-    local last_val="${values[$((n-1))]}"
-    local first_ts="${timestamps[0]}"
-    local last_ts="${timestamps[$((n-1))]}"
-
-    local dt=$((last_ts - first_ts))
-    [ "$dt" -le 0 ] && return 1
-
-    # Use awk for floating-point math (no bc dependency)
+    # Build ts/val input for awk, then compute moving average of positive deltas
     local result
-    result=$(awk -v dt="$dt" -v first="$first_val" -v last="$last_val" '
-        BEGIN {
-            dt_hours = dt / 3600
-            if (dt_hours <= 0) exit 1
-            rate = (last - first) / dt_hours
+    result=$(_cu_eta_build_input | \
+        awk -v window="$avg_window" '
+        {
+            ts[NR-1] = $1
+            val[NR-1] = $2
+            n = NR
+        }
+        END {
+            if (n < 2) exit 1
+            delta_count = 0
+            for (i = 1; i < n; i++) {
+                dt_hours = (ts[i] - ts[i-1]) / 3600
+                if (dt_hours <= 0) continue
+                delta = (val[i] - val[i-1]) / dt_hours
+                if (delta > 0) {
+                    deltas[delta_count] = delta
+                    delta_count++
+                }
+            }
+            if (delta_count == 0) exit 1
+
+            use_count = (window < delta_count) ? window : delta_count
+            start = delta_count - use_count
+            sum = 0
+            for (i = start; i < delta_count; i++) {
+                sum += deltas[i]
+            }
+            rate = sum / use_count
+
             if (rate <= 0) exit 1
-            remaining = 100 - last
+            remaining = 100 - val[n-1]
+            if (remaining <= 0) exit 1
             hours_to_cap = remaining / rate
             secs_to_cap = int(hours_to_cap * 3600)
             printf "%.1f %.1f %d", rate, hours_to_cap, secs_to_cap
@@ -129,7 +148,7 @@ cu_eta_projection() {
 
     # Check if before reset
     local reset_at
-    reset_at=$(cu_history_read "$hours" | tail -1 | jq -r ".$field.resets_at // empty" 2>/dev/null)
+    reset_at=$(cu_history_read "$read_hours" | tail -1 | jq -r ".$field.resets_at // empty" 2>/dev/null)
     local before_reset=""
     if [ -n "$reset_at" ]; then
         local secs_to_reset
@@ -141,6 +160,15 @@ cu_eta_projection() {
 
     # Output: space-delimited "rate hours secs before_reset_flag"
     printf "%s %s %s %s\n" "$rate" "$hours_to_cap" "$secs_to_cap" "${before_reset:+1}"
+}
+
+_cu_eta_build_input() {
+    # Helper: outputs "timestamp value" lines from the values/timestamps arrays
+    # These arrays are set by the calling cu_eta_projection function
+    local i
+    for ((i=0; i<${#timestamps[@]}; i++)); do
+        printf "%s %s\n" "${timestamps[$i]}" "${values[$i]}"
+    done
 }
 
 cu_braille_sparkline() {

@@ -74,20 +74,29 @@ _statusline_single() {
             parts+=("$(printf "7d: %s%d%%%s%s" "$(cu_color "$seven_color")" "$seven_int" "$(cu_reset)" "$reset_part")")
         fi
 
-        # ETA projection
-        local eta_info
-        eta_info=$(cu_eta_projection "seven_day" 48 2>/dev/null || true)
-        if [ -n "$eta_info" ]; then
-            local eta_rate eta_hours eta_secs before_reset
-            read -r eta_rate eta_hours eta_secs before_reset <<< "$eta_info"
-            if [ -n "${eta_secs:-}" ] && [ "${eta_secs:-0}" -gt 0 ] 2>/dev/null; then
-                local eta_str
-                eta_str=$(cu_fmt_duration "$eta_secs")
-                local eta_part="~${eta_str} to cap"
-                [ "${before_reset:-}" = "1" ] && eta_part="$(cu_color "$CU_RED")${eta_part}$(cu_reset)"
-                parts+=("$eta_part")
+        # ETA projections for configured windows
+        local _eta_win
+        for _eta_win in ${CU_ETA_WINDOWS//,/ }; do
+            local _eta_field="" _eta_avg="" _eta_label=""
+            case "$_eta_win" in
+                five_hour) _eta_field="five_hour"; _eta_avg="${CU_ETA_5H_AVG:-3}"; _eta_label="5h" ;;
+                seven_day) _eta_field="seven_day"; _eta_avg="${CU_ETA_7D_AVG:-24}"; _eta_label="7d" ;;
+                *) continue ;;
+            esac
+            local eta_info
+            eta_info=$(cu_eta_projection "$_eta_field" "$_eta_avg" 2>/dev/null || true)
+            if [ -n "$eta_info" ]; then
+                local eta_rate eta_hours eta_secs before_reset
+                read -r eta_rate eta_hours eta_secs before_reset <<< "$eta_info"
+                if [ -n "${eta_secs:-}" ] && [ "${eta_secs:-0}" -gt 0 ] 2>/dev/null; then
+                    local eta_str
+                    eta_str=$(cu_fmt_duration "$eta_secs")
+                    local eta_part="${_eta_label}: ~${eta_str} to cap"
+                    [ "${before_reset:-}" = "1" ] && eta_part="$(cu_color "$CU_RED")${eta_part}$(cu_reset)"
+                    parts+=("$eta_part")
+                fi
             fi
-        fi
+        done
 
         if [ ${#parts[@]} -gt 0 ]; then
             usage_section=" $(cu_color "$CU_DIM")|$(cu_reset) "
@@ -159,31 +168,48 @@ _statusline_multiline() {
         fi
     fi
 
-    # Line 3: sparkline + ETA (if available)
-    local spark eta_str=""
+    # Line 3: sparkline + dual ETAs (if available)
+    local spark
     spark=$(cu_sparkline_from_history "seven_day" 168 20 2>/dev/null)
 
-    local eta_info
-    eta_info=$(cu_eta_projection "seven_day" 48 2>/dev/null || true)
-    if [ -n "$eta_info" ]; then
-        local eta_rate eta_hours eta_secs before_reset
-        read -r eta_rate eta_hours eta_secs before_reset <<< "$eta_info"
-        if [ -n "${eta_secs:-}" ] && [ "${eta_secs:-0}" -gt 0 ] 2>/dev/null; then
-            eta_str="~$(cu_fmt_duration "$eta_secs") to cap"
-            if [ "${before_reset:-}" = "1" ]; then
-                eta_str="$(cu_color "$CU_RED")${eta_str}$(cu_reset)"
-            else
-                eta_str="$(cu_color "$CU_DIM")${eta_str}$(cu_reset)"
+    local eta_parts=()
+    local _eta_win
+    for _eta_win in ${CU_ETA_WINDOWS//,/ }; do
+        local _eta_field="" _eta_avg="" _eta_label=""
+        case "$_eta_win" in
+            five_hour) _eta_field="five_hour"; _eta_avg="${CU_ETA_5H_AVG:-3}"; _eta_label="5h" ;;
+            seven_day) _eta_field="seven_day"; _eta_avg="${CU_ETA_7D_AVG:-24}"; _eta_label="7d" ;;
+            *) continue ;;
+        esac
+        local eta_info
+        eta_info=$(cu_eta_projection "$_eta_field" "$_eta_avg" 2>/dev/null || true)
+        if [ -n "$eta_info" ]; then
+            local eta_rate eta_hours eta_secs before_reset
+            read -r eta_rate eta_hours eta_secs before_reset <<< "$eta_info"
+            if [ -n "${eta_secs:-}" ] && [ "${eta_secs:-0}" -gt 0 ] 2>/dev/null; then
+                local eta_str="${_eta_label}: ~$(cu_fmt_duration "$eta_secs") to cap"
+                if [ "${before_reset:-}" = "1" ]; then
+                    eta_str="$(cu_color "$CU_RED")${eta_str}$(cu_reset)"
+                else
+                    eta_str="$(cu_color "$CU_DIM")${eta_str}$(cu_reset)"
+                fi
+                eta_parts+=("$eta_str")
             fi
         fi
-    fi
+    done
 
-    if [ -n "$spark" ] || [ -n "$eta_str" ]; then
+    if [ -n "$spark" ] || [ ${#eta_parts[@]} -gt 0 ]; then
         printf "\n"
         [ -n "$spark" ] && printf "%s%s%s" "$(cu_color "$CU_DIM")" "$spark" "$(cu_reset)"
-        if [ -n "$eta_str" ]; then
-            [ -n "$spark" ] && printf "  "
-            printf "%s" "$eta_str"
-        fi
+        local _ep_first=1
+        for _ep in "${eta_parts[@]}"; do
+            if [ "$_ep_first" = "1" ]; then
+                [ -n "$spark" ] && printf "  "
+                _ep_first=0
+            else
+                printf " $(cu_color "$CU_DIM")|$(cu_reset) "
+            fi
+            printf "%s" "$_ep"
+        done
     fi
 }
