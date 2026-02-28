@@ -27,6 +27,20 @@ cu_sparkline() {
         step=$((count / width))
     fi
 
+    # Auto-scale: find actual max and scale to it (floor stays at 0)
+    # This makes low-range data (e.g. 5-15%) show meaningful variation
+    local data_max=0
+    local j=0
+    while [ "$j" -lt "$count" ]; do
+        local v="${values[$j]}"
+        v="${v%.*}"; v="${v:-0}"
+        [ "$v" -gt "$data_max" ] 2>/dev/null && data_max="$v"
+        j=$((j + step))
+    done
+    # Use data max for scaling, but at least 1 to avoid division by zero
+    local scale_max="$data_max"
+    [ "$scale_max" -lt 1 ] 2>/dev/null && scale_max=1
+
     local i=0
     local chars_written=0
     while [ "$i" -lt "$count" ] && [ "$chars_written" -lt "$width" ]; do
@@ -36,13 +50,9 @@ cu_sparkline() {
         [ "$val" -lt 0 ] 2>/dev/null && val=0
         [ "$val" -gt "$max_val" ] 2>/dev/null && val="$max_val"
 
-        # Map to 0-7 index
+        # Map to 0-7 index, scaled to actual data max
         local idx
-        if [ "$max_val" -gt 0 ]; then
-            idx=$(( (val * 7) / max_val ))
-        else
-            idx=0
-        fi
+        idx=$(( (val * 7) / scale_max ))
         [ "$idx" -gt 7 ] && idx=7
 
         printf '%s' "${CU_SPARK_ARRAY[$idx]}"
@@ -201,8 +211,20 @@ cu_braille_sparkline() {
     # Right column (dots 8,5,4 from bottom): 0=⠀ 1=⠠ 2=⠰ 3=⠸
     # Braille base: U+2800, dots are bit flags: d1=0x01 d2=0x02 d3=0x04 d4=0x08 d5=0x10 d6=0x20 d7=0x40 d8=0x80
     # We use dots 1,2,3 for left (bits 0x01,0x02,0x04) and dots 4,5,6 for right (bits 0x08,0x10,0x20)
-    local left_bits=(0 1 3 7)    # 0=none, 1=d1, 2=d1+d2, 3=d1+d2+d3
-    local right_bits=(0 8 24 56) # 0=none, 1=d4, 2=d4+d5, 3=d4+d5+d6
+    # Fill from bottom up: d3(0x04) is bottom-left, d6(0x20) is bottom-right
+    local left_bits=(0 4 6 7)     # 0=none, 1=d3, 2=d2+d3, 3=d1+d2+d3
+    local right_bits=(0 32 48 56) # 0=none, 1=d6, 2=d5+d6, 3=d4+d5+d6
+
+    # Auto-scale: find actual max (floor stays at 0)
+    local data_max=0
+    local j
+    for ((j=0; j<${#values[@]}; j++)); do
+        local v="${values[$j]}"
+        v="${v%.*}"; v="${v:-0}"
+        [ "$v" -gt "$data_max" ] 2>/dev/null && data_max="$v"
+    done
+    local scale_max="$data_max"
+    [ "$scale_max" -lt 1 ] 2>/dev/null && scale_max=1
 
     local i=0
     local count=${#values[@]}
@@ -211,8 +233,7 @@ cu_braille_sparkline() {
         lval="${lval%.*}"; lval="${lval:-0}"
         [ "$lval" -lt 0 ] 2>/dev/null && lval=0
         [ "$lval" -gt "$max_val" ] 2>/dev/null && lval="$max_val"
-        local lidx=0
-        [ "$max_val" -gt 0 ] && lidx=$(( (lval * 3) / max_val ))
+        local lidx=$(( (lval * 3) / scale_max ))
         [ "$lidx" -gt 3 ] && lidx=3
 
         local rval=0 ridx=0
@@ -221,7 +242,7 @@ cu_braille_sparkline() {
             rval="${rval%.*}"; rval="${rval:-0}"
             [ "$rval" -lt 0 ] 2>/dev/null && rval=0
             [ "$rval" -gt "$max_val" ] 2>/dev/null && rval="$max_val"
-            [ "$max_val" -gt 0 ] && ridx=$(( (rval * 3) / max_val ))
+            ridx=$(( (rval * 3) / scale_max ))
             [ "$ridx" -gt 3 ] && ridx=3
         fi
 
@@ -245,16 +266,72 @@ cu_sparkline_from_history() {
         esac
     fi
 
-    local values=()
-    while IFS= read -r val; do
-        [ -n "$val" ] && values+=("$val")
-    done < <(cu_history_values "$tier" "$field" "$hours")
+    # For braille mode, we need 2x data points (2 values per char)
+    local data_points="$width"
+    [ "$compact" = "braille" ] && data_points=$((width * 2))
 
-    [ ${#values[@]} -eq 0 ] && return
+    # Read timestamped records and bucket into fixed time slots
+    # Each slot covers (hours*3600/data_points) seconds
+    local now
+    now=$(cu_now)
+    local window_start=$((now - hours * 3600))
+    local slot_secs=$(( (hours * 3600) / data_points ))
+
+    # Initialize buckets: track last known value per slot for delta computation
+    local -a bucket_vals=()
+    local i
+    for ((i=0; i<data_points; i++)); do
+        bucket_vals[$i]=""
+    done
+
+    # Read all records with timestamps and values
+    local -a rec_ts=() rec_val=()
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        local ts val
+        ts=$(echo "$line" | jq -r '.ts' 2>/dev/null)
+        val=$(echo "$line" | jq -r ".$field.util" 2>/dev/null)
+        [ -z "$ts" ] || [ -z "$val" ] || [ "$val" = "null" ] && continue
+        rec_ts+=("$ts")
+        rec_val+=("$val")
+    done < <(cu_history_read "$tier" "$hours")
+
+    [ ${#rec_ts[@]} -eq 0 ] && return
+
+    # Assign each record to a time slot
+    for ((i=0; i<${#rec_ts[@]}; i++)); do
+        local slot=$(( (rec_ts[$i] - window_start) / slot_secs ))
+        [ "$slot" -lt 0 ] && slot=0
+        [ "$slot" -ge "$data_points" ] && slot=$((data_points - 1))
+        bucket_vals[$slot]="${rec_val[$i]}"
+    done
+
+    # Compute deltas between consecutive slots that have data
+    # For empty slots, output 0 (no activity in that period)
+    local -a deltas=()
+    local prev_val=""
+    for ((i=0; i<data_points; i++)); do
+        if [ -n "${bucket_vals[$i]}" ]; then
+            if [ -n "$prev_val" ]; then
+                local cur="${bucket_vals[$i]%.*}" prv="${prev_val%.*}"
+                cur="${cur:-0}"; prv="${prv:-0}"
+                local d=$((cur - prv))
+                [ "$d" -lt 0 ] && d=0
+                deltas+=("$d")
+            else
+                deltas+=(0)
+            fi
+            prev_val="${bucket_vals[$i]}"
+        else
+            deltas+=(0)
+        fi
+    done
+
+    [ ${#deltas[@]} -eq 0 ] && return
 
     if [ "$compact" = "braille" ]; then
-        cu_braille_sparkline "${values[@]}"
+        cu_braille_sparkline "${deltas[@]}"
     else
-        CU_OPT_WIDTH="$width" cu_sparkline "${values[@]}"
+        CU_OPT_WIDTH="$width" cu_sparkline "${deltas[@]}"
     fi
 }

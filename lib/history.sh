@@ -121,6 +121,25 @@ cu_history_values() {
     cu_history_read "$tier" "$hours" | jq -r ".$field.util" 2>/dev/null
 }
 
+cu_history_deltas() {
+    # Output per-interval deltas (rate of change) instead of absolute values
+    # Negative deltas (resets) are clamped to 0
+    local tier="${1:-long}" field="${2:-seven_day}" hours="${3:-168}"
+    local prev="" val=""
+    while IFS= read -r val; do
+        [ -z "$val" ] && continue
+        if [ -n "$prev" ]; then
+            local prev_int="${prev%.*}" val_int="${val%.*}"
+            prev_int="${prev_int:-0}"; val_int="${val_int:-0}"
+            local delta=$((val_int - prev_int))
+            # Clamp negative deltas (resets) to 0
+            [ "$delta" -lt 0 ] 2>/dev/null && delta=0
+            echo "$delta"
+        fi
+        prev="$val"
+    done < <(cu_history_values "$tier" "$field" "$hours")
+}
+
 cu_history_dump() {
     if [ -f "$CU_HISTORY_SHORT" ]; then
         echo "=== Short tier (5-min, 24h) ==="

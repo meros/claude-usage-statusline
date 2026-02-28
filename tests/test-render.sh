@@ -45,7 +45,11 @@ result=$(CU_OPT_WIDTH=4 cu_sparkline 100 100 100 100)
 assert_eq "sparkline all 100" "████" "$result"
 
 result=$(CU_OPT_WIDTH=1 cu_sparkline 50)
-assert_eq "sparkline single 50" "▄" "$result"
+assert_eq "sparkline single 50 (auto-scaled to max)" "█" "$result"
+
+# Auto-scaling: low-range values should show variation
+result=$(CU_OPT_WIDTH=4 cu_sparkline 0 5 10 15)
+assert_eq "sparkline auto-scale low range" "▁▃▅█" "$result"
 
 echo ""
 echo "=== Braille Sparkline Tests ==="

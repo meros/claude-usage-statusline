@@ -28,7 +28,7 @@ cu_view_dashboard() {
     printf "%sClaude Usage%s\n" "$(cu_color "$CU_FG")" "$(cu_reset)"
     printf "%s============%s\n\n" "$(cu_color "$CU_DIM")" "$(cu_reset)"
 
-    # 5-Hour Window
+    # 5-Hour Window (grouped: bar + sparkline + ETA + reset)
     if [ -n "$five_pct" ]; then
         local five_int="${five_pct%.*}"
         printf "%s5-Hour Window%s\n" "$(cu_color "$CU_FG")" "$(cu_reset)"
@@ -36,14 +36,31 @@ cu_view_dashboard() {
         if [ -n "$five_reset" ]; then
             local secs
             secs=$(cu_secs_until_reset "$five_reset")
-            if [ "$secs" -gt 0 ] 2>/dev/null; then
-                printf "    %sresets in %s%s" "$(cu_color "$CU_DIM")" "$(cu_fmt_duration "$secs")" "$(cu_reset)"
+            [ "$secs" -gt 0 ] 2>/dev/null && printf "    %sresets in %s%s" "$(cu_color "$CU_DIM")" "$(cu_fmt_duration "$secs")" "$(cu_reset)"
+        fi
+
+        if [[ "${CU_ETA_WINDOWS}" == *"five_hour"* ]]; then
+            local eta_info
+            eta_info=$(cu_eta_projection "five_hour" "${CU_ETA_5H_AVG:-3}" 2>/dev/null || true)
+            if [ -n "$eta_info" ]; then
+                local rate eta_hours eta_secs before_reset
+                read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+                if [ -n "${eta_hours:-}" ]; then
+                    printf "\n  %s+%s%%/h | ~%s to cap" "+$rate" "$rate" "$(cu_fmt_duration "${eta_secs:-0}")"
+                    [ "${before_reset:-}" = "1" ] && printf " | %sBEFORE RESET%s" "$(cu_color "$CU_RED")" "$(cu_reset)"
+                fi
             fi
+        fi
+
+        local spark_short
+        spark_short=$(cu_sparkline_from_history "five_hour" 5 20 "braille" 2>/dev/null || true)
+        if [ -n "$spark_short" ]; then
+            printf "\n  %sBurn rate:%s %s" "$(cu_color "$CU_DIM")" "$(cu_reset)" "$spark_short"
         fi
         printf "\n\n"
     fi
 
-    # 7-Day Window
+    # 7-Day Window (grouped: bar + sparkline + ETA + reset)
     if [ -n "$seven_pct" ]; then
         local seven_int="${seven_pct%.*}"
         printf "%s7-Day Window%s\n" "$(cu_color "$CU_FG")" "$(cu_reset)"
@@ -54,48 +71,29 @@ cu_view_dashboard() {
             secs=$(cu_secs_until_reset "$seven_reset")
             if [ -n "$reset_date" ]; then
                 printf "    %sresets %s" "$(cu_color "$CU_DIM")" "$reset_date"
-                if [ "$secs" -gt 0 ] 2>/dev/null; then
-                    printf " (%s)" "$(cu_fmt_duration "$secs")"
-                fi
+                [ "$secs" -gt 0 ] 2>/dev/null && printf " (%s)" "$(cu_fmt_duration "$secs")"
                 printf "%s" "$(cu_reset)"
             fi
         fi
-        printf "\n\n"
-    fi
 
-    # Sparkline history
-    local spark
-    spark=$(cu_sparkline_from_history "seven_day" 168 40 2>/dev/null)
-    if [ -n "$spark" ]; then
-        printf "  %sHourly (last 7 days):%s\n" "$(cu_color "$CU_DIM")" "$(cu_reset)"
-        printf "  %s\n\n" "$spark"
-    fi
-
-    # ETA Projections for each configured window
-    local _eta_win
-    for _eta_win in ${CU_ETA_WINDOWS//,/ }; do
-        local _eta_field="" _eta_avg="" _eta_label=""
-        case "$_eta_win" in
-            five_hour) _eta_field="five_hour"; _eta_avg="${CU_ETA_5H_AVG:-3}"; _eta_label="5-Hour" ;;
-            seven_day) _eta_field="seven_day"; _eta_avg="${CU_ETA_7D_AVG:-24}"; _eta_label="7-Day" ;;
-            *) continue ;;
-        esac
-        local eta_info
-        eta_info=$(cu_eta_projection "$_eta_field" "$_eta_avg" 2>/dev/null || true)
-        if [ -n "$eta_info" ]; then
-            local rate eta_hours eta_secs before_reset
-            read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-            if [ -n "${eta_hours:-}" ]; then
-                printf "%s${_eta_label} Projection:%s " "$(cu_color "$CU_FG")" "$(cu_reset)"
-                printf "+%s%%/h" "$rate"
-                local eta_dur
-                eta_dur=$(cu_fmt_duration "${eta_secs:-0}")
-                printf " | ~%s to 100%%" "$eta_dur"
-                if [ "${before_reset:-}" = "1" ]; then
-                    printf " | %sBEFORE RESET%s" "$(cu_color "$CU_RED")" "$(cu_reset)"
+        if [[ "${CU_ETA_WINDOWS}" == *"seven_day"* ]]; then
+            local eta_info
+            eta_info=$(cu_eta_projection "seven_day" "${CU_ETA_7D_AVG:-24}" 2>/dev/null || true)
+            if [ -n "$eta_info" ]; then
+                local rate eta_hours eta_secs before_reset
+                read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+                if [ -n "${eta_hours:-}" ]; then
+                    printf "\n  +%s%%/h | ~%s to cap" "$rate" "$(cu_fmt_duration "${eta_secs:-0}")"
+                    [ "${before_reset:-}" = "1" ] && printf " | %sBEFORE RESET%s" "$(cu_color "$CU_RED")" "$(cu_reset)"
                 fi
-                printf "\n"
             fi
         fi
-    done
+
+        local spark_long
+        spark_long=$(cu_sparkline_from_history "seven_day" 168 20 "braille" 2>/dev/null || true)
+        if [ -n "$spark_long" ]; then
+            printf "\n  %sBurn rate:%s %s" "$(cu_color "$CU_DIM")" "$(cu_reset)" "$spark_long"
+        fi
+        printf "\n\n"
+    fi
 }
