@@ -161,7 +161,7 @@ cmd_history() {
 
 cmd_install_hook() {
     parse_flags "$@"
-    local settings_file="$HOME/.claude/settings.json"
+    local settings_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
     local cmd
     # Determine command path
     cmd="$(cd "$SCRIPT_DIR" && pwd)/claude-usage"
