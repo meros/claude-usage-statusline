@@ -30,6 +30,7 @@ CU_OPT_NO_COLOR=""
 CU_OPT_NO_FETCH=""
 CU_OPT_WIDTH=""
 CU_OPT_HOURS=""
+CU_OPT_BRAILLE=""
 
 parse_flags() {
     while [ $# -gt 0 ]; do
@@ -61,6 +62,9 @@ parse_flags() {
                 shift
                 CU_OPT_HOURS="$1"
                 ;;
+            --braille)
+                CU_OPT_BRAILLE=1
+                ;;
             *)
                 echo "Unknown flag: $1" >&2
                 return 1
@@ -88,13 +92,15 @@ cmd_sparkline() {
     parse_flags "$@"
     local hours="${CU_OPT_HOURS:-168}"
     local width="${CU_OPT_WIDTH:-40}"
+    local mode=""
+    [ "${CU_OPT_BRAILLE:-}" = "1" ] && mode="braille"
     if [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
         cu_fetch
         local cache_data
         cache_data=$(cu_read_cache)
         [ -n "$cache_data" ] && cu_history_record "$cache_data"
     fi
-    cu_sparkline_from_history "seven_day" "$hours" "$width"
+    cu_sparkline_from_history "seven_day" "$hours" "$width" "$mode"
     echo
 }
 
@@ -186,6 +192,7 @@ Flags:
   --cache-dir   Override cache directory
   --width N     Sparkline/bar width
   --hours N     History window in hours
+  --braille     Use compact Braille sparkline (2 data points per char)
 EOF
 }
 

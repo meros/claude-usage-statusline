@@ -48,6 +48,22 @@ result=$(CU_OPT_WIDTH=1 cu_sparkline 50)
 assert_eq "sparkline single 50" "▄" "$result"
 
 echo ""
+echo "=== Braille Sparkline Tests ==="
+
+# Braille sparkline: pairs of values encoded per char
+# 0,0 -> empty braille U+2800
+result=$(cu_braille_sparkline 0 0)
+assert_eq "braille zeros" "⠀" "$result"
+
+# 100,100 -> full braille (bits d1+d2+d3+d4+d5+d6 = 0x3F)
+result=$(cu_braille_sparkline 100 100)
+assert_eq "braille full" "⠿" "$result"
+
+# 4 values = 2 braille chars
+result=$(cu_braille_sparkline 0 0 100 100)
+assert_eq "braille 4 values length" 2 "${#result}"
+
+echo ""
 echo "=== Progress Bar Tests ==="
 
 # Progress bar (no-color mode for predictable output)

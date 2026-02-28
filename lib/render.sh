@@ -145,8 +145,61 @@ cu_eta_projection() {
     printf "\n"
 }
 
+cu_braille_sparkline() {
+    # Compact sparkline using Braille characters — 2 data points per column.
+    # Left column uses dots 1,2,3 (⠁⠂⠄), right column uses dots 4,5,6 (⠈⠐⠠).
+    # Encodes pairs of values into a single Braille character.
+    local values=()
+    local max_val="${CU_SPARK_MAX:-100}"
+
+    if [ $# -gt 0 ]; then
+        values=("$@")
+    else
+        while IFS= read -r line; do
+            [ -n "$line" ] && values+=("$line")
+        done
+    fi
+
+    [ ${#values[@]} -eq 0 ] && return
+
+    # Braille dot patterns for 4 levels (0-3) per column
+    # Left column (dots 7,2,1 from bottom): 0=⠀ 1=⠄ 2=⠆ 3=⠇
+    # Right column (dots 8,5,4 from bottom): 0=⠀ 1=⠠ 2=⠰ 3=⠸
+    # Braille base: U+2800, dots are bit flags: d1=0x01 d2=0x02 d3=0x04 d4=0x08 d5=0x10 d6=0x20 d7=0x40 d8=0x80
+    # We use dots 1,2,3 for left (bits 0x01,0x02,0x04) and dots 4,5,6 for right (bits 0x08,0x10,0x20)
+    local left_bits=(0 1 3 7)    # 0=none, 1=d1, 2=d1+d2, 3=d1+d2+d3
+    local right_bits=(0 8 24 56) # 0=none, 1=d4, 2=d4+d5, 3=d4+d5+d6
+
+    local i=0
+    local count=${#values[@]}
+    while [ "$i" -lt "$count" ]; do
+        local lval="${values[$i]}"
+        lval="${lval%.*}"; lval="${lval:-0}"
+        [ "$lval" -lt 0 ] 2>/dev/null && lval=0
+        [ "$lval" -gt "$max_val" ] 2>/dev/null && lval="$max_val"
+        local lidx=$(( (lval * 3) / (max_val > 0 ? max_val : 1) ))
+        [ "$lidx" -gt 3 ] && lidx=3
+
+        local rval=0 ridx=0
+        if [ $((i + 1)) -lt "$count" ]; then
+            rval="${values[$((i + 1))]}"
+            rval="${rval%.*}"; rval="${rval:-0}"
+            [ "$rval" -lt 0 ] 2>/dev/null && rval=0
+            [ "$rval" -gt "$max_val" ] 2>/dev/null && rval="$max_val"
+            ridx=$(( (rval * 3) / (max_val > 0 ? max_val : 1) ))
+            [ "$ridx" -gt 3 ] && ridx=3
+        fi
+
+        local codepoint=$((0x2800 + ${left_bits[$lidx]} + ${right_bits[$ridx]}))
+        printf "\\U$(printf '%08x' "$codepoint")"
+
+        i=$((i + 2))
+    done
+}
+
 cu_sparkline_from_history() {
     local field="${1:-seven_day}" hours="${2:-168}" width="${3:-40}"
+    local compact="${4:-}" # "braille" for compact mode
     local values=()
     while IFS= read -r val; do
         [ -n "$val" ] && values+=("$val")
@@ -154,5 +207,9 @@ cu_sparkline_from_history() {
 
     [ ${#values[@]} -eq 0 ] && return
 
-    CU_OPT_WIDTH="$width" cu_sparkline "${values[@]}"
+    if [ "$compact" = "braille" ]; then
+        cu_braille_sparkline "${values[@]}"
+    else
+        CU_OPT_WIDTH="$width" cu_sparkline "${values[@]}"
+    fi
 }
