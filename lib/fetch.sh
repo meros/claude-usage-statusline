@@ -19,8 +19,9 @@ cu_fetch() {
         return 0
     fi
 
+    local cred_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
     local token
-    token=$(jq -r '.claudeAiOauth.accessToken // empty' ~/.claude/.credentials.json 2>/dev/null)
+    token=$(jq -r '.claudeAiOauth.accessToken // empty' "$cred_file" 2>/dev/null)
     if [ -z "$token" ]; then
         return 1
     fi
