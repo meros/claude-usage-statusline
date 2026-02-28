@@ -10,7 +10,7 @@ mkdir -p "$CU_DATA_DIR" "$CU_CACHE_DIR"
 
 # Epoch override for deterministic tests
 cu_now() {
-    if [ -n "$CU_NOW" ]; then
+    if [ -n "${CU_NOW:-}" ]; then
         echo "$CU_NOW"
     else
         date +%s
@@ -18,7 +18,7 @@ cu_now() {
 }
 
 cu_date() {
-    if [ -n "$CU_NOW" ]; then
+    if [ -n "${CU_NOW:-}" ]; then
         date -d "@$CU_NOW" "$@" 2>/dev/null || date -r "$CU_NOW" "$@" 2>/dev/null
     else
         date "$@"

@@ -31,6 +31,7 @@ CU_OPT_NO_FETCH=""
 CU_OPT_WIDTH=""
 CU_OPT_HOURS=""
 CU_OPT_BRAILLE=""
+CU_OPT_MULTILINE=""
 
 parse_flags() {
     while [ $# -gt 0 ]; do
@@ -64,6 +65,9 @@ parse_flags() {
                 ;;
             --braille)
                 CU_OPT_BRAILLE=1
+                ;;
+            --multiline)
+                CU_OPT_MULTILINE=1
                 ;;
             *)
                 echo "Unknown flag: $1" >&2
@@ -113,13 +117,13 @@ cmd_eta() {
         [ -n "$cache_data" ] && cu_history_record "$cache_data"
     fi
     local eta_info
-    eta_info=$(cu_eta_projection "seven_day" "${CU_OPT_HOURS:-48}" 2>/dev/null)
+    eta_info=$(cu_eta_projection "seven_day" "${CU_OPT_HOURS:-48}" 2>/dev/null || true)
     if [ -n "$eta_info" ]; then
         local rate eta_hours eta_secs before_reset
-        eval "$eta_info" 2>/dev/null
+        read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
         local eta_dur
         eta_dur=$(cu_fmt_duration "${eta_secs:-0}")
-        printf "Rate: +%s%%/hour\n" "$rate"
+        printf "Rate: +%s%%/hour\n" "${rate:-0}"
         printf "ETA to 100%%: ~%s\n" "$eta_dur"
         [ "${before_reset:-}" = "1" ] && printf "%sWARNING: Projected to hit limit BEFORE reset%s\n" "$(cu_color "$CU_RED")" "$(cu_reset)"
     else
@@ -162,8 +166,13 @@ cmd_install_hook() {
 
     # Use jq to set the statusLine.command
     local tmp="${settings_file}.tmp"
-    jq --arg cmd "$cmd statusline" '.statusLine.command = $cmd' "$settings_file" > "$tmp"
-    mv "$tmp" "$settings_file"
+    if jq --arg cmd "$cmd statusline" '.statusLine.command = $cmd' "$settings_file" > "$tmp"; then
+        mv "$tmp" "$settings_file"
+    else
+        rm -f "$tmp"
+        echo "Failed to update settings (invalid JSON?)" >&2
+        return 1
+    fi
 
     echo "Configured Claude Code statusline:"
     echo "  command: $cmd statusline"
@@ -193,12 +202,13 @@ Flags:
   --width N     Sparkline/bar width
   --hours N     History window in hours
   --braille     Use compact Braille sparkline (2 data points per char)
+  --multiline   Multi-line statusline (progress bars + sparkline)
 EOF
 }
 
 # Main dispatch
 subcommand="${1:-show}"
-shift 2>/dev/null || true
+shift || true
 
 case "$subcommand" in
     show)           cmd_show "$@" ;;

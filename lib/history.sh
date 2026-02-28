@@ -45,8 +45,11 @@ cu_history_prune() {
     cutoff=$((now - CU_HISTORY_MAX_AGE))
 
     local tmp="${CU_HISTORY_FILE}.tmp"
-    jq -c "select(.ts >= $cutoff)" "$CU_HISTORY_FILE" > "$tmp" 2>/dev/null
-    mv "$tmp" "$CU_HISTORY_FILE"
+    if jq -c --argjson cutoff "$cutoff" 'select(.ts >= $cutoff)' "$CU_HISTORY_FILE" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$CU_HISTORY_FILE"
+    else
+        rm -f "$tmp"
+    fi
 }
 
 cu_history_read() {
@@ -56,7 +59,7 @@ cu_history_read() {
     cutoff=$((now - hours * 3600))
 
     [ -f "$CU_HISTORY_FILE" ] || return 0
-    jq -c "select(.ts >= $cutoff)" "$CU_HISTORY_FILE" 2>/dev/null
+    jq -c --argjson cutoff "$cutoff" 'select(.ts >= $cutoff)' "$CU_HISTORY_FILE" 2>/dev/null
 }
 
 cu_history_values() {

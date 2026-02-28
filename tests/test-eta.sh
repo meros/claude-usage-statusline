@@ -54,7 +54,7 @@ eta_info=$(cu_eta_projection "seven_day" 168 2>/dev/null)
 assert_nonzero "eta produces output with history" "$eta_info"
 
 if [ -n "$eta_info" ]; then
-    eval "$eta_info"
+    read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
     assert_nonzero "rate is non-zero" "${rate:-0}"
     assert_nonzero "eta_hours is non-zero" "${eta_hours:-0}"
     assert_nonzero "eta_secs is non-zero" "${eta_secs:-0}"

@@ -139,10 +139,8 @@ cu_eta_projection() {
         fi
     fi
 
-    # Output
-    printf "rate=%s eta_hours=%s eta_secs=%s" "$rate" "$hours_to_cap" "$secs_to_cap"
-    [ -n "$before_reset" ] && printf " before_reset=1"
-    printf "\n"
+    # Output: space-delimited "rate hours secs before_reset_flag"
+    printf "%s %s %s %s\n" "$rate" "$hours_to_cap" "$secs_to_cap" "${before_reset:+1}"
 }
 
 cu_braille_sparkline() {
@@ -177,7 +175,8 @@ cu_braille_sparkline() {
         lval="${lval%.*}"; lval="${lval:-0}"
         [ "$lval" -lt 0 ] 2>/dev/null && lval=0
         [ "$lval" -gt "$max_val" ] 2>/dev/null && lval="$max_val"
-        local lidx=$(( (lval * 3) / (max_val > 0 ? max_val : 1) ))
+        local lidx=0
+        [ "$max_val" -gt 0 ] && lidx=$(( (lval * 3) / max_val ))
         [ "$lidx" -gt 3 ] && lidx=3
 
         local rval=0 ridx=0
@@ -186,7 +185,7 @@ cu_braille_sparkline() {
             rval="${rval%.*}"; rval="${rval:-0}"
             [ "$rval" -lt 0 ] 2>/dev/null && rval=0
             [ "$rval" -gt "$max_val" ] 2>/dev/null && rval="$max_val"
-            ridx=$(( (rval * 3) / (max_val > 0 ? max_val : 1) ))
+            [ "$max_val" -gt 0 ] && ridx=$(( (rval * 3) / max_val ))
             [ "$ridx" -gt 3 ] && ridx=3
         fi
 

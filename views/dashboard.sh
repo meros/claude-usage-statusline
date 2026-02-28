@@ -73,11 +73,11 @@ cu_view_dashboard() {
 
     # ETA Projection
     local eta_info
-    eta_info=$(cu_eta_projection "seven_day" 48 2>/dev/null)
+    eta_info=$(cu_eta_projection "seven_day" 48 2>/dev/null || true)
     if [ -n "$eta_info" ]; then
         local rate eta_hours eta_secs before_reset
-        eval "$eta_info" 2>/dev/null
-        if [ -n "$eta_hours" ]; then
+        read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+        if [ -n "${eta_hours:-}" ]; then
             printf "%sProjection:%s " "$(cu_color "$CU_FG")" "$(cu_reset)"
             printf "+%s%%/h" "$rate"
             local eta_dur
