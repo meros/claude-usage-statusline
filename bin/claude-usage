@@ -43,7 +43,7 @@ CU_OPT_MULTILINE=""
 
 # ETA defaults (configurable via env vars)
 CU_ETA_WINDOWS="${CU_ETA_WINDOWS:-five_hour,seven_day}"
-CU_ETA_5H_AVG="${CU_ETA_5H_AVG:-3}"
+CU_ETA_5H_AVG="${CU_ETA_5H_AVG:-1}"
 CU_ETA_7D_AVG="${CU_ETA_7D_AVG:-24}"
 
 parse_flags() {
@@ -236,7 +236,7 @@ Flags:
 
 Environment:
   CU_ETA_WINDOWS  ETA windows to show (default: five_hour,seven_day)
-  CU_ETA_5H_AVG   Moving avg window for 5h ETA in hours (default: 3)
+  CU_ETA_5H_AVG   Moving avg window for 5h ETA in hours (default: 1)
   CU_ETA_7D_AVG   Moving avg window for 7d ETA in hours (default: 24)
 EOF
 }
