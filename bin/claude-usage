@@ -23,6 +23,15 @@ if [ "$LIB_DIR" = "@""LIB_DIR""@" ]; then
     VIEWS_DIR="${SCRIPT_DIR}/../views"
 fi
 
+# Check dependencies
+for _dep in jq curl; do
+    if ! command -v "$_dep" >/dev/null 2>&1; then
+        echo "Error: '$_dep' is required but not found. Install it and try again." >&2
+        exit 1
+    fi
+done
+unset _dep
+
 # Source libraries
 # shellcheck source=../lib/util.sh
 source "${LIB_DIR}/util.sh"
@@ -58,29 +67,29 @@ parse_flags() {
                 CU_OPT_NO_FETCH=1
                 ;;
             --tier)
-                shift
-                CU_OPT_TIER="$1"
+                [ $# -ge 2 ] || { echo "Error: --tier requires a value (short or long)" >&2; return 1; }
+                shift; CU_OPT_TIER="$1"
                 ;;
             --data-dir)
-                shift
-                CU_DATA_DIR="$1"
+                [ $# -ge 2 ] || { echo "Error: --data-dir requires a path" >&2; return 1; }
+                shift; CU_DATA_DIR="$1"
                 CU_HISTORY_SHORT="${CU_DATA_DIR}/history-short.jsonl"
                 CU_HISTORY_LONG="${CU_DATA_DIR}/history-long.jsonl"
                 mkdir -p "$CU_DATA_DIR"
                 ;;
             --cache-dir)
-                shift
-                CU_CACHE_DIR="$1"
+                [ $# -ge 2 ] || { echo "Error: --cache-dir requires a path" >&2; return 1; }
+                shift; CU_CACHE_DIR="$1"
                 CU_CACHE_FILE="${CU_CACHE_DIR}/api-response.json"
                 mkdir -p "$CU_CACHE_DIR"
                 ;;
             --width)
-                shift
-                CU_OPT_WIDTH="$1"
+                [ $# -ge 2 ] || { echo "Error: --width requires a number" >&2; return 1; }
+                shift; CU_OPT_WIDTH="$1"
                 ;;
             --hours)
-                shift
-                CU_OPT_HOURS="$1"
+                [ $# -ge 2 ] || { echo "Error: --hours requires a number" >&2; return 1; }
+                shift; CU_OPT_HOURS="$1"
                 ;;
             --braille)
                 CU_OPT_BRAILLE=1
@@ -89,8 +98,8 @@ parse_flags() {
                 CU_OPT_MULTILINE=1
                 ;;
             --eta-windows)
-                shift
-                CU_ETA_WINDOWS="$1"
+                [ $# -ge 2 ] || { echo "Error: --eta-windows requires a value" >&2; return 1; }
+                shift; CU_ETA_WINDOWS="$1"
                 ;;
             *)
                 echo "Unknown flag: $1" >&2
@@ -125,7 +134,7 @@ cmd_sparkline() {
     local mode=""
     [ "${CU_OPT_BRAILLE:-}" = "1" ] && mode="braille"
     if [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
-        cu_fetch
+        cu_fetch || true
         local cache_data
         cache_data=$(cu_read_cache)
         [ -n "$cache_data" ] && cu_history_record "$cache_data"
@@ -137,7 +146,7 @@ cmd_sparkline() {
 cmd_eta() {
     parse_flags "$@"
     if [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
-        cu_fetch
+        cu_fetch || true
         local cache_data
         cache_data=$(cu_read_cache)
         [ -n "$cache_data" ] && cu_history_record "$cache_data"
@@ -189,12 +198,31 @@ cmd_history() {
     local tier="${CU_OPT_TIER:-}"
     if [ -n "$tier" ]; then
         case "$tier" in
-            short) [ -f "$CU_HISTORY_SHORT" ] && cat "$CU_HISTORY_SHORT" ;;
-            long)  [ -f "$CU_HISTORY_LONG" ] && cat "$CU_HISTORY_LONG" ;;
-            *)     echo "Unknown tier: $tier (use short or long)" >&2; return 1 ;;
+            short)
+                if [ -f "$CU_HISTORY_SHORT" ]; then
+                    cat "$CU_HISTORY_SHORT"
+                else
+                    echo "No short-tier history yet. Run 'claude-usage fetch' to start recording." >&2
+                fi
+                ;;
+            long)
+                if [ -f "$CU_HISTORY_LONG" ]; then
+                    cat "$CU_HISTORY_LONG"
+                else
+                    echo "No long-tier history yet. Run 'claude-usage fetch' to start recording." >&2
+                fi
+                ;;
+            *)
+                echo "Unknown tier: $tier (use short or long)" >&2
+                return 1
+                ;;
         esac
     else
-        cu_history_dump
+        if [ ! -f "$CU_HISTORY_SHORT" ] && [ ! -f "$CU_HISTORY_LONG" ]; then
+            echo "No history yet. Run 'claude-usage fetch' to start recording." >&2
+        else
+            cu_history_dump
+        fi
     fi
 }
 

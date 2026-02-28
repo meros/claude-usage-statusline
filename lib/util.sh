@@ -8,6 +8,17 @@ CU_CACHE_DIR="${CU_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-usage}"
 # Ensure directories exist
 mkdir -p "$CU_DATA_DIR" "$CU_CACHE_DIR"
 
+# Debug logging: CU_DEBUG=1 to enable, CU_LOG_FILE=path to log to file
+cu_log() {
+    [ "${CU_DEBUG:-}" = "1" ] || return 0
+    local msg="[claude-usage] $*"
+    if [ -n "${CU_LOG_FILE:-}" ]; then
+        echo "$msg" >> "$CU_LOG_FILE"
+    else
+        echo "$msg" >&2
+    fi
+}
+
 # Epoch override for deterministic tests
 cu_now() {
     if [ -n "${CU_NOW:-}" ]; then

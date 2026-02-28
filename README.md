@@ -61,11 +61,12 @@ Colors: green <50%, yellow 50-80%, red >80%. Gruvbox palette.
 ## Features
 
 - **5-hour and 7-day windows** — color-coded usage with reset countdown
-- **Hourly history** — JSONL with 14-day retention, deduplicated per hour
+- **Dual-tier history** — short tier (5-min intervals, 24h) for session tracking, long tier (hourly, 1yr) for weekly trends
 - **Sparkline trends** — standard blocks (`▁▂▃▄▅▆▇█`) or compact Braille mode
 - **ETA projection** — predicts when you'll hit 100%, warns if before reset
 - **Multi-line statusline** — progress bars, sparkline, and ETA in your Claude Code status
 - **Rich dashboard** — full terminal view with `claude-usage show`
+- **Auto-migration** — seamlessly upgrades from old single-file history
 - **XDG-compliant** — respects `XDG_DATA_HOME` and `XDG_CACHE_HOME`
 
 ## Install
@@ -101,9 +102,9 @@ curl -fsSL https://raw.githubusercontent.com/meros/claude-usage-statusline/main/
 ```bash
 claude-usage                # full dashboard (default)
 claude-usage fetch          # force-refresh from API
-claude-usage sparkline      # sparkline string only
-claude-usage eta            # ETA projection
-claude-usage history        # dump raw JSONL
+claude-usage sparkline      # sparkline string only (--tier short|long)
+claude-usage eta            # ETA projection for all windows
+claude-usage history        # dump raw JSONL (--tier short|long)
 claude-usage install-hook   # configure Claude Code statusline
 ```
 
@@ -124,7 +125,7 @@ For multi-line mode with progress bars:
 claude-usage install-hook  # then append --multiline to the command
 ```
 
-History builds passively — every statusline refresh records a snapshot (deduplicated to one per hour).
+History builds passively — every statusline refresh records a snapshot. The short tier (5-min intervals) tracks session usage for responsive ETA projections, while the long tier (hourly) captures weekly trends.
 
 ## Flags
 
@@ -138,13 +139,26 @@ History builds passively — every statusline refresh records a snapshot (dedupl
 | `--hours N` | `168` | History window in hours |
 | `--braille` | | Compact Braille sparkline (2 data points per char) |
 | `--multiline` | | Multi-line statusline with progress bars |
+| `--eta-windows` | `five_hour,seven_day` | Comma-separated ETA windows to show |
+| `--tier T` | | History tier: `short` (5-min, 24h) or `long` (hourly, 1yr) |
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CU_ETA_WINDOWS` | `five_hour,seven_day` | ETA windows to show |
+| `CU_ETA_5H_AVG` | `1` | Moving average window for 5h ETA (hours) |
+| `CU_ETA_7D_AVG` | `24` | Moving average window for 7d ETA (hours) |
 
 ## Data
 
 | File | Location | Retention |
 |------|----------|-----------|
 | API cache | `$XDG_CACHE_HOME/claude-usage/api-response.json` | 5-minute TTL |
-| History | `$XDG_DATA_HOME/claude-usage/history.jsonl` | 14 days, hourly |
+| Short history | `$XDG_DATA_HOME/claude-usage/history-short.jsonl` | 24 hours, 5-min intervals (`five_hour` field) |
+| Long history | `$XDG_DATA_HOME/claude-usage/history-long.jsonl` | 1 year, hourly intervals (`seven_day` field) |
+
+On first run, any existing `history.jsonl` is automatically migrated to the dual-tier format (backup saved as `history.jsonl.bak`).
 
 ## Testing
 

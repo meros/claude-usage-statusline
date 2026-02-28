@@ -8,15 +8,17 @@ cu_view_statusline() {
         return 1
     fi
     input=$(cat)
+    cu_log "statusline: stdin ${#input} bytes"
 
     local cwd cwd_basename git_branch
     cwd=$(echo "$input" | jq -r '.workspace.current_dir // empty' 2>/dev/null)
     cwd_basename=$(basename "${cwd:-.}")
     git_branch=$(cd "$cwd" 2>/dev/null && git branch --show-current 2>/dev/null || true)
+    cu_log "statusline: cwd=$cwd branch=$git_branch"
 
-    # Fetch + record history
+    # Fetch + record history (don't abort on fetch failure under set -e)
     if [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
-        cu_fetch
+        cu_fetch || cu_log "statusline: fetch failed, using cached data"
         local cache_data
         cache_data=$(cu_read_cache)
         [ -n "$cache_data" ] && cu_history_record "$cache_data"
@@ -32,11 +34,16 @@ cu_view_statusline() {
         seven_pct=$(cu_get_seven_day_pct "$data")
         five_reset=$(cu_get_five_hour_reset "$data")
         seven_reset=$(cu_get_seven_day_reset "$data")
+        cu_log "statusline: five_pct=$five_pct seven_pct=$seven_pct"
+    else
+        cu_log "statusline: no cached data available"
     fi
 
     if [ "${CU_OPT_MULTILINE:-}" = "1" ]; then
+        cu_log "statusline: rendering multiline"
         _statusline_multiline
     else
+        cu_log "statusline: rendering single-line"
         _statusline_single
     fi
 }
@@ -109,7 +116,7 @@ _statusline_single() {
 
         # Sparkline from history
         local spark
-        spark=$(cu_sparkline_from_history "seven_day" 168 8 2>/dev/null)
+        spark=$(cu_sparkline_from_history "seven_day" 168 8 2>/dev/null || true)
         if [ -n "$spark" ]; then
             usage_section+=" $(cu_color "$CU_DIM")${spark}$(cu_reset)"
         fi
@@ -170,7 +177,7 @@ _statusline_multiline() {
 
     # Line 3: sparkline + dual ETAs (if available)
     local spark
-    spark=$(cu_sparkline_from_history "seven_day" 168 20 2>/dev/null)
+    spark=$(cu_sparkline_from_history "seven_day" 168 20 2>/dev/null || true)
 
     local eta_parts=()
     local _eta_win
