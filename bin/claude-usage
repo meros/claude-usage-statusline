@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Resolve library paths
+# Nix install: @LIB_DIR@ and @VIEWS_DIR@ are substituted at build time
+# Git install: use relative paths from this script's location
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+LIB_DIR="@LIB_DIR@"
+VIEWS_DIR="@VIEWS_DIR@"
+
+if [ "$LIB_DIR" = "@""LIB_DIR""@" ]; then
+    # Not substituted — running from source/git clone
+    LIB_DIR="${SCRIPT_DIR}/../lib"
+    VIEWS_DIR="${SCRIPT_DIR}/../views"
+fi
+
+# Source libraries
+# shellcheck source=../lib/util.sh
+source "${LIB_DIR}/util.sh"
+# shellcheck source=../lib/fetch.sh
+source "${LIB_DIR}/fetch.sh"
+# shellcheck source=../lib/history.sh
+source "${LIB_DIR}/history.sh"
+# shellcheck source=../lib/render.sh
+source "${LIB_DIR}/render.sh"
+
+# Parse global flags
+CU_OPT_NO_COLOR=""
+CU_OPT_NO_FETCH=""
+CU_OPT_WIDTH=""
+CU_OPT_HOURS=""
+
+parse_flags() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-color)
+                CU_OPT_NO_COLOR=1
+                CU_NO_COLOR=1
+                ;;
+            --no-fetch)
+                CU_OPT_NO_FETCH=1
+                ;;
+            --data-dir)
+                shift
+                CU_DATA_DIR="$1"
+                CU_HISTORY_FILE="${CU_DATA_DIR}/history.jsonl"
+                mkdir -p "$CU_DATA_DIR"
+                ;;
+            --cache-dir)
+                shift
+                CU_CACHE_DIR="$1"
+                CU_CACHE_FILE="${CU_CACHE_DIR}/api-response.json"
+                mkdir -p "$CU_CACHE_DIR"
+                ;;
+            --width)
+                shift
+                CU_OPT_WIDTH="$1"
+                ;;
+            --hours)
+                shift
+                CU_OPT_HOURS="$1"
+                ;;
+            *)
+                echo "Unknown flag: $1" >&2
+                return 1
+                ;;
+        esac
+        shift
+    done
+}
+
+cmd_show() {
+    parse_flags "$@"
+    # shellcheck source=../views/dashboard.sh
+    source "${VIEWS_DIR}/dashboard.sh"
+    cu_view_dashboard
+}
+
+cmd_statusline() {
+    parse_flags "$@"
+    # shellcheck source=../views/statusline.sh
+    source "${VIEWS_DIR}/statusline.sh"
+    cu_view_statusline
+}
+
+cmd_sparkline() {
+    parse_flags "$@"
+    local hours="${CU_OPT_HOURS:-168}"
+    local width="${CU_OPT_WIDTH:-40}"
+    if [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
+        cu_fetch
+        local cache_data
+        cache_data=$(cu_read_cache)
+        [ -n "$cache_data" ] && cu_history_record "$cache_data"
+    fi
+    cu_sparkline_from_history "seven_day" "$hours" "$width"
+    echo
+}
+
+cmd_eta() {
+    parse_flags "$@"
+    if [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
+        cu_fetch
+        local cache_data
+        cache_data=$(cu_read_cache)
+        [ -n "$cache_data" ] && cu_history_record "$cache_data"
+    fi
+    local eta_info
+    eta_info=$(cu_eta_projection "seven_day" "${CU_OPT_HOURS:-48}" 2>/dev/null)
+    if [ -n "$eta_info" ]; then
+        local rate eta_hours eta_secs before_reset
+        eval "$eta_info" 2>/dev/null
+        local eta_dur
+        eta_dur=$(cu_fmt_duration "${eta_secs:-0}")
+        printf "Rate: +%s%%/hour\n" "$rate"
+        printf "ETA to 100%%: ~%s\n" "$eta_dur"
+        [ "${before_reset:-}" = "1" ] && printf "%sWARNING: Projected to hit limit BEFORE reset%s\n" "$(cu_color "$CU_RED")" "$(cu_reset)"
+    else
+        echo "Insufficient history data for projection."
+    fi
+}
+
+cmd_fetch() {
+    parse_flags "$@"
+    echo "Fetching usage data..."
+    if cu_fetch "force"; then
+        local data
+        data=$(cu_read_cache)
+        cu_history_record "$data"
+        echo "OK. 5h: $(cu_get_five_hour_pct "$data")% | 7d: $(cu_get_seven_day_pct "$data")%"
+        cu_history_prune
+    else
+        echo "Failed to fetch usage data." >&2
+        return 1
+    fi
+}
+
+cmd_history() {
+    parse_flags "$@"
+    cu_history_dump
+}
+
+cmd_install_hook() {
+    parse_flags "$@"
+    local settings_file="$HOME/.claude/settings.json"
+    local cmd
+    # Determine command path
+    cmd="$(cd "$SCRIPT_DIR" && pwd)/claude-usage"
+
+    # Ensure settings file exists
+    mkdir -p "$(dirname "$settings_file")"
+    if [ ! -f "$settings_file" ]; then
+        echo '{}' > "$settings_file"
+    fi
+
+    # Use jq to set the statusLine.command
+    local tmp="${settings_file}.tmp"
+    jq --arg cmd "$cmd statusline" '.statusLine.command = $cmd' "$settings_file" > "$tmp"
+    mv "$tmp" "$settings_file"
+
+    echo "Configured Claude Code statusline:"
+    echo "  command: $cmd statusline"
+    echo "  settings: $settings_file"
+}
+
+cmd_help() {
+    cat <<'EOF'
+claude-usage - Claude API usage monitor with history and projections
+
+Usage: claude-usage [command] [flags]
+
+Commands:
+  show          Full dashboard (default)
+  statusline    Claude Code single-line output (reads workspace JSON from stdin)
+  sparkline     Compact sparkline string only
+  eta           ETA projection line
+  fetch         Force-fetch + record history
+  history       Dump raw JSONL history
+  install-hook  Configure ~/.claude/settings.json
+
+Flags:
+  --no-color    Disable color output
+  --no-fetch    Skip API fetch, use cached data
+  --data-dir    Override data directory
+  --cache-dir   Override cache directory
+  --width N     Sparkline/bar width
+  --hours N     History window in hours
+EOF
+}
+
+# Main dispatch
+subcommand="${1:-show}"
+shift 2>/dev/null || true
+
+case "$subcommand" in
+    show)           cmd_show "$@" ;;
+    statusline)     cmd_statusline "$@" ;;
+    sparkline)      cmd_sparkline "$@" ;;
+    eta)            cmd_eta "$@" ;;
+    fetch)          cmd_fetch "$@" ;;
+    history)        cmd_history "$@" ;;
+    install-hook)   cmd_install_hook "$@" ;;
+    help|--help|-h) cmd_help ;;
+    *)
+        echo "Unknown command: $subcommand" >&2
+        cmd_help >&2
+        exit 1
+        ;;
+esac
