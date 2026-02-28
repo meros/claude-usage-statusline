@@ -40,6 +40,7 @@ CU_OPT_WIDTH=""
 CU_OPT_HOURS=""
 CU_OPT_BRAILLE=""
 CU_OPT_MULTILINE=""
+CU_OPT_TIER=""
 
 # ETA defaults (configurable via env vars)
 CU_ETA_WINDOWS="${CU_ETA_WINDOWS:-five_hour,seven_day}"
@@ -56,10 +57,15 @@ parse_flags() {
             --no-fetch)
                 CU_OPT_NO_FETCH=1
                 ;;
+            --tier)
+                shift
+                CU_OPT_TIER="$1"
+                ;;
             --data-dir)
                 shift
                 CU_DATA_DIR="$1"
-                CU_HISTORY_FILE="${CU_DATA_DIR}/history.jsonl"
+                CU_HISTORY_SHORT="${CU_DATA_DIR}/history-short.jsonl"
+                CU_HISTORY_LONG="${CU_DATA_DIR}/history-long.jsonl"
                 mkdir -p "$CU_DATA_DIR"
                 ;;
             --cache-dir)
@@ -113,6 +119,9 @@ cmd_sparkline() {
     parse_flags "$@"
     local hours="${CU_OPT_HOURS:-168}"
     local width="${CU_OPT_WIDTH:-40}"
+    local tier="${CU_OPT_TIER:-long}"
+    local field="seven_day"
+    [ "$tier" = "short" ] && field="five_hour"
     local mode=""
     [ "${CU_OPT_BRAILLE:-}" = "1" ] && mode="braille"
     if [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
@@ -121,7 +130,7 @@ cmd_sparkline() {
         cache_data=$(cu_read_cache)
         [ -n "$cache_data" ] && cu_history_record "$cache_data"
     fi
-    cu_sparkline_from_history "seven_day" "$hours" "$width" "$mode"
+    cu_sparkline_from_history "$field" "$hours" "$width" "$mode" "$tier"
     echo
 }
 
@@ -177,7 +186,16 @@ cmd_fetch() {
 
 cmd_history() {
     parse_flags "$@"
-    cu_history_dump
+    local tier="${CU_OPT_TIER:-}"
+    if [ -n "$tier" ]; then
+        case "$tier" in
+            short) [ -f "$CU_HISTORY_SHORT" ] && cat "$CU_HISTORY_SHORT" ;;
+            long)  [ -f "$CU_HISTORY_LONG" ] && cat "$CU_HISTORY_LONG" ;;
+            *)     echo "Unknown tier: $tier (use short or long)" >&2; return 1 ;;
+        esac
+    else
+        cu_history_dump
+    fi
 }
 
 cmd_install_hook() {
@@ -233,6 +251,11 @@ Flags:
   --braille     Use compact Braille sparkline (2 data points per char)
   --multiline   Multi-line statusline (progress bars + sparkline)
   --eta-windows Comma-separated ETA windows: five_hour,seven_day (default: both)
+  --tier T      History tier: short (5-min, 24h, five_hour) or long (hourly, 1yr, seven_day)
+
+History tiers:
+  short         5-min intervals, 24h retention, five_hour field (session limit)
+  long          Hourly intervals, 1yr retention, seven_day field (weekly limit)
 
 Environment:
   CU_ETA_WINDOWS  ETA windows to show (default: five_hour,seven_day)

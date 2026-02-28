@@ -86,10 +86,18 @@ cu_fmt_pct() {
 
 cu_eta_projection() {
     # Calculate ETA to 100% using moving average of positive hourly deltas
-    # Args: field (five_hour|seven_day), avg_window (number of recent positive deltas to average)
-    local field="${1:-seven_day}" avg_window="${2:-24}"
+    # Args: field (five_hour|seven_day), avg_window (number of recent positive deltas to average), tier (short|long)
+    local field="${1:-seven_day}" avg_window="${2:-24}" tier="${3:-}"
     local values=()
     local timestamps=()
+
+    # Default tier based on field
+    if [ -z "$tier" ]; then
+        case "$field" in
+            five_hour) tier="short" ;;
+            *)         tier="long" ;;
+        esac
+    fi
 
     # Read enough history to cover the averaging window
     local read_hours=$((avg_window + 1))
@@ -99,7 +107,7 @@ cu_eta_projection() {
         ts=$(echo "$line" | jq -r '.ts' 2>/dev/null)
         val=$(echo "$line" | jq -r ".$field.util" 2>/dev/null)
         [ -n "$ts" ] && [ -n "$val" ] && timestamps+=("$ts") && values+=("$val")
-    done < <(cu_history_read "$read_hours")
+    done < <(cu_history_read "$tier" "$read_hours")
 
     local n=${#values[@]}
     [ "$n" -lt 2 ] && return 1
@@ -148,7 +156,7 @@ cu_eta_projection() {
 
     # Check if before reset
     local reset_at
-    reset_at=$(cu_history_read "$read_hours" | tail -1 | jq -r ".$field.resets_at // empty" 2>/dev/null)
+    reset_at=$(cu_history_read "$tier" "$read_hours" | tail -1 | jq -r ".$field.resets_at // empty" 2>/dev/null)
     local before_reset=""
     if [ -n "$reset_at" ]; then
         local secs_to_reset
@@ -227,10 +235,20 @@ cu_braille_sparkline() {
 cu_sparkline_from_history() {
     local field="${1:-seven_day}" hours="${2:-168}" width="${3:-40}"
     local compact="${4:-}" # "braille" for compact mode
+    local tier="${5:-}"
+
+    # Default tier based on field
+    if [ -z "$tier" ]; then
+        case "$field" in
+            five_hour) tier="short" ;;
+            *)         tier="long" ;;
+        esac
+    fi
+
     local values=()
     while IFS= read -r val; do
         [ -n "$val" ] && values+=("$val")
-    done < <(cu_history_values "$field" "$hours")
+    done < <(cu_history_values "$tier" "$field" "$hours")
 
     [ ${#values[@]} -eq 0 ] && return
 

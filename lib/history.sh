@@ -1,67 +1,161 @@
 #!/usr/bin/env bash
-# history.sh - JSONL append/query with hourly dedup, 14-day prune
+# history.sh - Dual-tier JSONL history: short (5-min) + long (hourly)
 
-CU_HISTORY_FILE="${CU_DATA_DIR}/history.jsonl"
-CU_HISTORY_MAX_AGE="${CU_HISTORY_MAX_AGE:-1209600}" # 14 days in seconds
+# Short tier: 5-min intervals, 24h retention, five_hour field only
+CU_HISTORY_SHORT="${CU_DATA_DIR}/history-short.jsonl"
+CU_SHORT_INTERVAL=300        # 5 minutes in seconds
+CU_SHORT_MAX_AGE=86400       # 24 hours
+
+# Long tier: hourly intervals, 1-year retention, seven_day field only
+CU_HISTORY_LONG="${CU_DATA_DIR}/history-long.jsonl"
+CU_LONG_INTERVAL=3600        # 1 hour in seconds
+CU_LONG_MAX_AGE=31536000     # 365 days
+
+_CU_MIGRATED=""
+
+cu_tier_for_field() {
+    case "$1" in five_hour) echo short ;; *) echo long ;; esac
+}
 
 cu_history_record() {
     local data="${1:-$(cu_read_cache)}"
     [ -z "$data" ] && return 1
 
+    # Auto-migrate old single-file history on first call
+    if [ -z "$_CU_MIGRATED" ]; then
+        cu_history_migrate
+        _CU_MIGRATED=1
+    fi
+
     local now
     now=$(cu_now)
 
-    # Deduplicate by hour: skip if last entry is within the same hour
-    local hour_bucket=$((now / 3600))
-    if [ -f "$CU_HISTORY_FILE" ]; then
-        local last_ts
-        last_ts=$(tail -1 "$CU_HISTORY_FILE" 2>/dev/null | jq -r '.ts // 0' 2>/dev/null)
-        local last_bucket=$((last_ts / 3600))
-        if [ "$hour_bucket" = "$last_bucket" ]; then
-            return 0
+    # Short tier: 5-min dedup, five_hour field only
+    local has_five_hour
+    has_five_hour=$(echo "$data" | jq -e '.five_hour' >/dev/null 2>&1 && echo 1 || echo 0)
+    if [ "$has_five_hour" = "1" ]; then
+        local short_bucket=$((now / CU_SHORT_INTERVAL))
+        local write_short=1
+        if [ -f "$CU_HISTORY_SHORT" ]; then
+            local last_ts
+            last_ts=$(tail -1 "$CU_HISTORY_SHORT" 2>/dev/null | jq -r '.ts // 0' 2>/dev/null)
+            local last_bucket=$((last_ts / CU_SHORT_INTERVAL))
+            [ "$short_bucket" = "$last_bucket" ] && write_short=0
+        fi
+        if [ "$write_short" = "1" ]; then
+            local short_line
+            short_line=$(echo "$data" | jq -c --argjson ts "$now" \
+                '{ts: $ts, five_hour: {util: .five_hour.utilization, resets_at: (.five_hour.resets_at // "")}}' \
+                2>/dev/null) || true
+            [ -n "$short_line" ] && echo "$short_line" >> "$CU_HISTORY_SHORT"
         fi
     fi
 
-    # Build record with only the windows present in the API response
-    local line
-    line=$(echo "$data" | jq -c --argjson ts "$now" '
-        {ts: $ts}
-        + (if .five_hour then {five_hour: {util: .five_hour.utilization, resets_at: (.five_hour.resets_at // "")}} else {} end)
-        + (if .seven_day then {seven_day: {util: .seven_day.utilization, resets_at: (.seven_day.resets_at // "")}} else {} end)
-    ' 2>/dev/null) || return 1
-
-    echo "$line" >> "$CU_HISTORY_FILE"
+    # Long tier: hourly dedup, seven_day field only
+    local has_seven_day
+    has_seven_day=$(echo "$data" | jq -e '.seven_day' >/dev/null 2>&1 && echo 1 || echo 0)
+    if [ "$has_seven_day" = "1" ]; then
+        local long_bucket=$((now / CU_LONG_INTERVAL))
+        local write_long=1
+        if [ -f "$CU_HISTORY_LONG" ]; then
+            local last_ts
+            last_ts=$(tail -1 "$CU_HISTORY_LONG" 2>/dev/null | jq -r '.ts // 0' 2>/dev/null)
+            local last_bucket=$((last_ts / CU_LONG_INTERVAL))
+            [ "$long_bucket" = "$last_bucket" ] && write_long=0
+        fi
+        if [ "$write_long" = "1" ]; then
+            local long_line
+            long_line=$(echo "$data" | jq -c --argjson ts "$now" \
+                '{ts: $ts, seven_day: {util: .seven_day.utilization, resets_at: (.seven_day.resets_at // "")}}' \
+                2>/dev/null) || true
+            [ -n "$long_line" ] && echo "$long_line" >> "$CU_HISTORY_LONG"
+        fi
+    fi
 }
 
 cu_history_prune() {
-    [ -f "$CU_HISTORY_FILE" ] || return 0
-    local now cutoff
+    local now
     now=$(cu_now)
-    cutoff=$((now - CU_HISTORY_MAX_AGE))
 
-    local tmp="${CU_HISTORY_FILE}.tmp"
-    if jq -c --argjson cutoff "$cutoff" 'select(.ts >= $cutoff)' "$CU_HISTORY_FILE" > "$tmp" 2>/dev/null; then
-        mv "$tmp" "$CU_HISTORY_FILE"
-    else
-        rm -f "$tmp"
+    # Prune short tier (24h)
+    if [ -f "$CU_HISTORY_SHORT" ]; then
+        local cutoff=$((now - CU_SHORT_MAX_AGE))
+        local tmp="${CU_HISTORY_SHORT}.tmp"
+        if jq -c --argjson cutoff "$cutoff" 'select(.ts >= $cutoff)' "$CU_HISTORY_SHORT" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$CU_HISTORY_SHORT"
+        else
+            rm -f "$tmp"
+        fi
+    fi
+
+    # Prune long tier (1 year)
+    if [ -f "$CU_HISTORY_LONG" ]; then
+        local cutoff=$((now - CU_LONG_MAX_AGE))
+        local tmp="${CU_HISTORY_LONG}.tmp"
+        if jq -c --argjson cutoff "$cutoff" 'select(.ts >= $cutoff)' "$CU_HISTORY_LONG" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$CU_HISTORY_LONG"
+        else
+            rm -f "$tmp"
+        fi
     fi
 }
 
 cu_history_read() {
-    local hours="${1:-168}" # default 7 days
-    local now cutoff
+    local tier="${1:-long}" hours="${2:-168}"
+    local now cutoff file
     now=$(cu_now)
     cutoff=$((now - hours * 3600))
 
-    [ -f "$CU_HISTORY_FILE" ] || return 0
-    jq -c --argjson cutoff "$cutoff" 'select(.ts >= $cutoff)' "$CU_HISTORY_FILE" 2>/dev/null
+    case "$tier" in
+        short) file="$CU_HISTORY_SHORT" ;;
+        long)  file="$CU_HISTORY_LONG" ;;
+        *)     file="$CU_HISTORY_LONG" ;;
+    esac
+
+    [ -f "$file" ] || return 0
+    jq -c --argjson cutoff "$cutoff" 'select(.ts >= $cutoff)' "$file" 2>/dev/null
 }
 
 cu_history_values() {
-    local field="${1:-seven_day}" hours="${2:-168}"
-    cu_history_read "$hours" | jq -r ".$field.util" 2>/dev/null
+    local tier="${1:-long}" field="${2:-seven_day}" hours="${3:-168}"
+    cu_history_read "$tier" "$hours" | jq -r ".$field.util" 2>/dev/null
 }
 
 cu_history_dump() {
-    [ -f "$CU_HISTORY_FILE" ] && cat "$CU_HISTORY_FILE"
+    if [ -f "$CU_HISTORY_SHORT" ]; then
+        echo "=== Short tier (5-min, 24h) ==="
+        cat "$CU_HISTORY_SHORT"
+    fi
+    if [ -f "$CU_HISTORY_LONG" ]; then
+        echo "=== Long tier (hourly, 1yr) ==="
+        cat "$CU_HISTORY_LONG"
+    fi
+}
+
+cu_history_migrate() {
+    local old_file="${CU_DATA_DIR}/history.jsonl"
+    # Only migrate if old file exists and neither new file nor backup exists
+    [ -f "$old_file" ] || return 0
+    [ -f "$CU_HISTORY_SHORT" ] && return 0
+    [ -f "$CU_HISTORY_LONG" ] && return 0
+    [ -f "${old_file}.bak" ] && return 0
+
+    local now
+    now=$(cu_now)
+    local short_cutoff=$((now - CU_SHORT_MAX_AGE))
+
+    # Migrate last 24h → short (five_hour only)
+    jq -c --argjson cutoff "$short_cutoff" \
+        'select(.ts >= $cutoff) | select(.five_hour) | {ts, five_hour}' \
+        "$old_file" > "$CU_HISTORY_SHORT" 2>/dev/null || true
+
+    # Migrate all → long (seven_day only)
+    jq -c 'select(.seven_day) | {ts, seven_day}' \
+        "$old_file" > "$CU_HISTORY_LONG" 2>/dev/null || true
+
+    # Remove empty files
+    [ -s "$CU_HISTORY_SHORT" ] || rm -f "$CU_HISTORY_SHORT"
+    [ -s "$CU_HISTORY_LONG" ] || rm -f "$CU_HISTORY_LONG"
+
+    mv "$old_file" "${old_file}.bak"
 }
