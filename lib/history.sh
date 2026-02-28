@@ -8,12 +8,8 @@ cu_history_record() {
     local data="${1:-$(cu_read_cache)}"
     [ -z "$data" ] && return 1
 
-    local now five_pct five_reset seven_pct seven_reset
+    local now
     now=$(cu_now)
-    five_pct=$(echo "$data" | jq -r '.five_hour.utilization // 0' 2>/dev/null)
-    five_reset=$(echo "$data" | jq -r '.five_hour.resets_at // ""' 2>/dev/null)
-    seven_pct=$(echo "$data" | jq -r '.seven_day.utilization // 0' 2>/dev/null)
-    seven_reset=$(echo "$data" | jq -r '.seven_day.resets_at // ""' 2>/dev/null)
 
     # Deduplicate by hour: skip if last entry is within the same hour
     local hour_bucket=$((now / 3600))
@@ -26,14 +22,13 @@ cu_history_record() {
         fi
     fi
 
+    # Build record with only the windows present in the API response
     local line
-    line=$(jq -nc \
-        --argjson ts "$now" \
-        --argjson fu "$five_pct" \
-        --arg fr "$five_reset" \
-        --argjson su "$seven_pct" \
-        --arg sr "$seven_reset" \
-        '{ts:$ts, five_hour:{util:$fu, resets_at:$fr}, seven_day:{util:$su, resets_at:$sr}}')
+    line=$(echo "$data" | jq -c --argjson ts "$now" '
+        {ts: $ts}
+        + (if .five_hour then {five_hour: {util: .five_hour.utilization, resets_at: (.five_hour.resets_at // "")}} else {} end)
+        + (if .seven_day then {seven_day: {util: .seven_day.utilization, resets_at: (.seven_day.resets_at // "")}} else {} end)
+    ' 2>/dev/null) || return 1
 
     echo "$line" >> "$CU_HISTORY_FILE"
 }

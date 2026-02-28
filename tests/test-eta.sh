@@ -180,6 +180,32 @@ eta_info=$(cu_eta_projection "seven_day" 24 2>/dev/null || true)
 assert_eq "no eta with only negative deltas" "" "$eta_info"
 
 echo ""
+echo "=== Five-Hour-Only Data (No Weekly Limit) ==="
+
+# Users without weekly limits — seven_day field absent from history
+> "$CU_HISTORY_FILE"
+local_base=1700000000
+for i in 0 1 2 3 4; do
+    ts=$((local_base + i * 3600))
+    val=$((10 + i * 5))
+    echo "{\"ts\":$ts,\"five_hour\":{\"util\":$val,\"resets_at\":\"\"}}" >> "$CU_HISTORY_FILE"
+done
+export CU_NOW=$((local_base + 4 * 3600))
+
+# five_hour ETA should work
+eta_info=$(cu_eta_projection "five_hour" 3 2>/dev/null)
+assert_nonzero "five_hour ETA works without seven_day" "$eta_info"
+
+if [ -n "$eta_info" ]; then
+    read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+    assert_eq "five_hour-only rate = 5.0" "5.0" "$rate"
+fi
+
+# seven_day ETA should gracefully fail (no data)
+eta_info=$(cu_eta_projection "seven_day" 24 2>/dev/null || true)
+assert_eq "seven_day ETA empty when field absent" "" "$eta_info"
+
+echo ""
 echo "=== Duration Formatting ==="
 
 result=$(cu_fmt_duration 3661)

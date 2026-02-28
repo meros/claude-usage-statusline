@@ -57,7 +57,8 @@ cu_fetch() {
         -H "anthropic-beta: oauth-2025-04-20" \
         "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
 
-    if echo "$resp" | jq -e '.seven_day' >/dev/null 2>&1; then
+    # Accept response if it has at least one usage window (five_hour or seven_day)
+    if echo "$resp" | jq -e '.five_hour // .seven_day' >/dev/null 2>&1; then
         echo "$resp" > "$CU_CACHE_FILE"
         return 0
     fi

@@ -80,5 +80,36 @@ lines_after=$(wc -l < "$CU_HISTORY_FILE")
 assert_eq "prune removes old entries" "2" "$lines_after"
 
 echo ""
+echo "=== Missing Seven-Day Window Tests ==="
+
+# Record data with only five_hour (no weekly limit)
+> "$CU_HISTORY_FILE"
+export CU_NOW=1709200000
+data_five_only='{"five_hour":{"utilization":25,"resets_at":"2025-03-01T14:00:00Z"}}'
+cu_history_record "$data_five_only"
+lines=$(wc -l < "$CU_HISTORY_FILE")
+assert_eq "five_hour-only record creates 1 line" "1" "$lines"
+
+# Verify five_hour data is present
+val=$(cu_history_values "five_hour" 24 | head -1)
+assert_eq "five_hour util recorded" "25" "$val"
+
+# Verify seven_day is absent (jq returns null)
+has_seven=$(jq -r '.seven_day // empty' "$CU_HISTORY_FILE" | head -1)
+assert_eq "seven_day absent in five_hour-only record" "" "$has_seven"
+
+# Record data with only seven_day (no session limit — hypothetical)
+> "$CU_HISTORY_FILE"
+export CU_NOW=1709200000
+data_seven_only='{"seven_day":{"utilization":40,"resets_at":"2025-03-06T00:00:00Z"}}'
+cu_history_record "$data_seven_only"
+
+val=$(cu_history_values "seven_day" 24 | head -1)
+assert_eq "seven_day util recorded when five_hour absent" "40" "$val"
+
+has_five=$(jq -r '.five_hour // empty' "$CU_HISTORY_FILE" | head -1)
+assert_eq "five_hour absent in seven_day-only record" "" "$has_five"
+
+echo ""
 printf "Results: %d passed, %d failed\n" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
