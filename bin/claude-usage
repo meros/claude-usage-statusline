@@ -4,7 +4,15 @@ set -euo pipefail
 # Resolve library paths
 # Nix install: @LIB_DIR@ and @VIEWS_DIR@ are substituted at build time
 # Git install: use relative paths from this script's location
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Follow symlinks so relative paths work when invoked via a symlink
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_SOURCE" ]; do
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+    SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+    # Handle relative symlink targets
+    [[ "$SCRIPT_SOURCE" != /* ]] && SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
 
 LIB_DIR="@LIB_DIR@"
 VIEWS_DIR="@VIEWS_DIR@"
