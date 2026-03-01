@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # statusline.sh - Claude Code status view (single-line or multi-line)
 
+# Default module lists (can be overridden via CU_MODULES env var)
+_CU_DEFAULT_MODULES_SINGLE="pct,sparkline,rate,eta,reset"
+_CU_DEFAULT_MODULES_MULTI="bar,pct,sparkline,rate,eta,reset"
+
 cu_view_statusline() {
     local input
     if [ -t 0 ]; then
@@ -39,6 +43,9 @@ cu_view_statusline() {
         cu_log "statusline: no cached data available"
     fi
 
+    # Trigger background update check
+    cu_update_check_bg
+
     if [ "${CU_OPT_MULTILINE:-}" = "1" ]; then
         cu_log "statusline: rendering multiline"
         _statusline_multiline
@@ -48,92 +55,172 @@ cu_view_statusline() {
     fi
 }
 
+# --- Module rendering functions ---
+# Each takes: window_field, pct, reset_time, and uses shared _eta_info_* vars
+
+_render_mod_bar() {
+    local pct_int="${1:-0}"
+    local width="${CU_BAR_WIDTH:-10}"
+    printf '%s' "$(cu_progress_bar "$pct_int" "$width")"
+}
+
+_render_mod_pct() {
+    local pct="${1:-0}"
+    cu_fmt_pct "$pct"
+}
+
+_render_mod_sparkline() {
+    local field="$1"
+    local spark_hours spark_tier spark_mode
+    case "$field" in
+        five_hour) spark_hours=5;   spark_tier="short" ;;
+        seven_day) spark_hours=168; spark_tier="long" ;;
+        *) return 0 ;;
+    esac
+    spark_mode="${CU_SPARKLINE_TYPE:-braille}"
+    # Normalize: anything not "block" becomes "braille"
+    [ "$spark_mode" != "block" ] && spark_mode="braille"
+    local spark
+    spark=$(cu_sparkline_from_history "$field" "$spark_hours" 8 "$spark_mode" "$spark_tier" 2>/dev/null || true)
+    [ -n "$spark" ] && printf '%s%s%s' "$(cu_color "${CU_COLOR_SPARKLINE}")" "$spark" "$(cu_reset)"
+    return 0
+}
+
+_render_mod_rate() {
+    # Uses shared _eta_rate, _eta_secs, _before_reset from _compute_eta
+    [ -z "${_eta_rate:-}" ] && return 0
+    local avg_window="$1"
+    local rate_str
+    rate_str=$(cu_fmt_rate_per_window "$_eta_rate" "$avg_window")
+    if [ "${_before_reset:-}" = "1" ]; then
+        printf '%s%s%s' "$(cu_color "${CU_COLOR_WARN}")" "$rate_str" "$(cu_reset)"
+    else
+        printf '%s%s%s' "$(cu_color "${CU_COLOR_RATE}")" "$rate_str" "$(cu_reset)"
+    fi
+}
+
+_render_mod_eta() {
+    # Uses shared _eta_secs, _before_reset from _compute_eta
+    [ -z "${_eta_secs:-}" ] && return 0
+    [ "${_eta_secs:-0}" -le 0 ] 2>/dev/null && return 0
+    local eta_str
+    eta_str=$(cu_fmt_duration "$_eta_secs")
+    if [ "${_before_reset:-}" = "1" ]; then
+        printf '%s~%s%s' "$(cu_color "${CU_COLOR_WARN}")" "$eta_str" "$(cu_reset)"
+    else
+        printf '%s~%s%s' "$(cu_color "${CU_COLOR_ETA}")" "$eta_str" "$(cu_reset)"
+    fi
+}
+
+_render_mod_reset() {
+    local field="$1" reset_time="$2"
+    [ -z "$reset_time" ] && return 0
+    case "$field" in
+        five_hour)
+            local secs
+            secs=$(cu_secs_until_reset "$reset_time")
+            if [ "${secs:-0}" -gt 0 ] 2>/dev/null; then
+                printf '%s↻%s %s%s%s' \
+                    "$(cu_color "${CU_COLOR_RESET_ICON}")" "$(cu_reset)" \
+                    "$(cu_color "${CU_COLOR_RESET}")" "$(cu_fmt_duration "$secs")" "$(cu_reset)"
+            fi
+            ;;
+        seven_day)
+            local reset_date
+            reset_date=$(cu_fmt_reset_date "$reset_time")
+            if [ -n "$reset_date" ]; then
+                printf '%s↻%s %s%s%s' \
+                    "$(cu_color "${CU_COLOR_RESET_ICON}")" "$(cu_reset)" \
+                    "$(cu_color "${CU_COLOR_RESET}")" "$reset_date" "$(cu_reset)"
+            fi
+            ;;
+    esac
+}
+
+# Compute ETA projection, storing results in shared variables
+_compute_eta() {
+    local field="$1" avg_window="$2"
+    _eta_rate="" _eta_hours="" _eta_secs="" _before_reset=""
+    local eta_info
+    eta_info=$(cu_eta_projection "$field" "$avg_window" 2>/dev/null || true)
+    [ -z "$eta_info" ] && return 0
+    read -r _eta_rate _eta_hours _eta_secs _before_reset <<< "$eta_info"
+}
+
+# Get window config: field, pct, reset_time, avg_window, label
+_window_config() {
+    local win="$1"
+    case "$win" in
+        five_hour)
+            _win_field="five_hour"
+            _win_pct="$five_pct"
+            _win_reset="$five_reset"
+            _win_avg="${CU_ETA_5H_AVG:-1}"
+            _win_label="5h"
+            ;;
+        seven_day)
+            _win_field="seven_day"
+            _win_pct="$seven_pct"
+            _win_reset="$seven_reset"
+            _win_avg="${CU_ETA_7D_AVG:-24}"
+            _win_label="7d"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# --- Single-line layout ---
+
 _statusline_single() {
+    local modules="${CU_MODULES:-${_CU_DEFAULT_MODULES_SINGLE}}"
+
     # Build directory + git branch section
     local dir_section
     if [ -n "$git_branch" ]; then
-        dir_section="$(cu_color "$CU_AQUA")${cwd_basename}$(cu_reset) $(cu_color "$CU_GREEN") ${git_branch}$(cu_reset)"
+        dir_section="$(cu_color "${CU_COLOR_DIR}")${cwd_basename}$(cu_reset) $(cu_color "${CU_COLOR_BRANCH}") ${git_branch}$(cu_reset)"
     else
-        dir_section="$(cu_color "$CU_AQUA")${cwd_basename}$(cu_reset)"
+        dir_section="$(cu_color "${CU_COLOR_DIR}")${cwd_basename}$(cu_reset)"
     fi
 
-    # Build usage section: group sparkline + ETA with each window
+    # Build usage section
     local usage_section=""
     if [ -n "$data" ]; then
         local parts=()
+        local _win
+        for _win in ${CU_WINDOWS//,/ }; do
+            local _win_field _win_pct _win_reset _win_avg _win_label
+            _window_config "$_win" || continue
+            [ -z "$_win_pct" ] && continue
 
-        # 5-Hour group: pct + sparkline + ETA
-        if [ -n "$five_pct" ]; then
-            local five_int="${five_pct%.*}"
-            local five_color
-            five_color=$(cu_pct_color "$five_int")
-            local five_part
-            five_part=$(printf "5h: %s%d%%%s" "$(cu_color "$five_color")" "$five_int" "$(cu_reset)")
+            local pct_int="${_win_pct%.*}"
+            pct_int="${pct_int:-0}"
 
-            local spark_short
-            spark_short=$(cu_sparkline_from_history "five_hour" 5 8 "braille" 2>/dev/null || true)
-            [ -n "$spark_short" ] && five_part+=" $(cu_color "$CU_DIM")${spark_short}$(cu_reset)"
+            # Compute ETA once for this window (shared by rate + eta modules)
+            _compute_eta "$_win_field" "$_win_avg"
 
-            if [[ " ${CU_ETA_WINDOWS} " == *" five_hour "* ]] || [[ "${CU_ETA_WINDOWS}" == *"five_hour"* ]]; then
-                local eta_info
-                eta_info=$(cu_eta_projection "five_hour" "${CU_ETA_5H_AVG:-3}" 2>/dev/null || true)
-                if [ -n "$eta_info" ]; then
-                    local eta_rate eta_hours eta_secs before_reset
-                    read -r eta_rate eta_hours eta_secs before_reset <<< "$eta_info"
-                    if [ -n "${eta_secs:-}" ] && [ "${eta_secs:-0}" -gt 0 ] 2>/dev/null; then
-                        local eta_str
-                        eta_str=$(cu_fmt_duration "$eta_secs")
-                        local eta_part="~${eta_str}"
-                        if [ "${before_reset:-}" = "1" ]; then
-                            five_part+=" $(cu_color "$CU_RED")${eta_part}$(cu_reset)"
-                        else
-                            five_part+=" ${eta_part}"
-                        fi
-                    fi
+            # Build this window's part from modules
+            local win_part=""
+            win_part+="$(cu_color "${CU_COLOR_LABEL}")${_win_label}:$(cu_reset) "
+
+            local _mod first_mod=1
+            for _mod in ${modules//,/ }; do
+                local mod_out=""
+                case "$_mod" in
+                    bar) continue ;;  # bar is multiline-only
+                    pct)       mod_out=$(_render_mod_pct "$_win_pct") ;;
+                    sparkline) mod_out=$(_render_mod_sparkline "$_win_field") ;;
+                    rate)      mod_out=$(_render_mod_rate "$_win_avg") ;;
+                    eta)       mod_out=$(_render_mod_eta) ;;
+                    reset)     mod_out=$(_render_mod_reset "$_win_field" "$_win_reset") ;;
+                    *) continue ;;
+                esac
+                if [ -n "$mod_out" ]; then
+                    [ "$first_mod" = "1" ] && first_mod=0 || win_part+=" "
+                    win_part+="$mod_out"
                 fi
-            fi
-            parts+=("$five_part")
-        fi
-
-        # 7-Day group: pct + sparkline + ETA + reset
-        if [ -n "$seven_pct" ]; then
-            local seven_int="${seven_pct%.*}"
-            local seven_color
-            seven_color=$(cu_pct_color "$seven_int")
-            local seven_part
-            seven_part=$(printf "7d: %s%d%%%s" "$(cu_color "$seven_color")" "$seven_int" "$(cu_reset)")
-
-            local spark_long
-            spark_long=$(cu_sparkline_from_history "seven_day" 168 8 "braille" 2>/dev/null || true)
-
-            [ -n "$spark_long" ] && seven_part+=" $(cu_color "$CU_DIM")${spark_long}$(cu_reset)"
-
-            if [[ " ${CU_ETA_WINDOWS} " == *" seven_day "* ]] || [[ "${CU_ETA_WINDOWS}" == *"seven_day"* ]]; then
-                local eta_info
-                eta_info=$(cu_eta_projection "seven_day" "${CU_ETA_7D_AVG:-24}" 2>/dev/null || true)
-                if [ -n "$eta_info" ]; then
-                    local eta_rate eta_hours eta_secs before_reset
-                    read -r eta_rate eta_hours eta_secs before_reset <<< "$eta_info"
-                    if [ -n "${eta_secs:-}" ] && [ "${eta_secs:-0}" -gt 0 ] 2>/dev/null; then
-                        local eta_str
-                        eta_str=$(cu_fmt_duration "$eta_secs")
-                        local eta_part="~${eta_str}"
-                        if [ "${before_reset:-}" = "1" ]; then
-                            seven_part+=" $(cu_color "$CU_RED")${eta_part}$(cu_reset)"
-                        else
-                            seven_part+=" ${eta_part}"
-                        fi
-                    fi
-                fi
-            fi
-
-            if [ -n "$seven_reset" ]; then
-                local reset_date
-                reset_date=$(cu_fmt_reset_date "$seven_reset")
-                [ -n "$reset_date" ] && seven_part+=" resets $reset_date"
-            fi
-            parts+=("$seven_part")
-        fi
+            done
+            parts+=("$win_part")
+        done
 
         if [ ${#parts[@]} -gt 0 ]; then
             usage_section=" $(cu_color "$CU_DIM")|$(cu_reset) "
@@ -146,96 +233,68 @@ _statusline_single() {
     fi
 
     printf "%s%s" "$dir_section" "$usage_section"
+
+    # Update notification (appended at end of line)
+    local update_msg
+    update_msg=$(cu_update_message)
+    [ -n "$update_msg" ] && printf " %s" "$update_msg"
+    return 0
 }
 
+# --- Multi-line layout ---
+
 _statusline_multiline() {
+    local modules="${CU_MODULES:-${_CU_DEFAULT_MODULES_MULTI}}"
+
     # Line 1: directory + branch
     if [ -n "$git_branch" ]; then
         printf "%s%s%s %s %s%s" \
-            "$(cu_color "$CU_AQUA")" "$cwd_basename" "$(cu_reset)" \
-            "$(cu_color "$CU_GREEN")" "$git_branch" "$(cu_reset)"
+            "$(cu_color "${CU_COLOR_DIR}")" "$cwd_basename" "$(cu_reset)" \
+            "$(cu_color "${CU_COLOR_BRANCH}")" "$git_branch" "$(cu_reset)"
     else
-        printf "%s%s%s" "$(cu_color "$CU_AQUA")" "$cwd_basename" "$(cu_reset)"
+        printf "%s%s%s" "$(cu_color "${CU_COLOR_DIR}")" "$cwd_basename" "$(cu_reset)"
     fi
 
-    [ -z "$data" ] && return
+    [ -z "$data" ] && return 0
 
-    local five_int="${five_pct%.*}"
-    local seven_int="${seven_pct%.*}"
-    five_int="${five_int:-0}"
-    seven_int="${seven_int:-0}"
+    # One line per window
+    local _win
+    for _win in ${CU_WINDOWS//,/ }; do
+        local _win_field _win_pct _win_reset _win_avg _win_label
+        _window_config "$_win" || continue
+        [ -z "$_win_pct" ] && continue
 
-    # Line 2: 5h group — bar + pct + sparkline + ETA + reset
-    if [ -n "$five_pct" ]; then
+        local pct_int="${_win_pct%.*}"
+        pct_int="${pct_int:-0}"
+
+        # Compute ETA once for this window
+        _compute_eta "$_win_field" "$_win_avg"
+
         printf "\n"
-        printf "%s5h%s %s %s" \
-            "$(cu_color "$CU_DIM")" "$(cu_reset)" \
-            "$(cu_progress_bar "$five_int" 10)" \
-            "$(cu_fmt_pct "$five_pct")"
+        printf "%s%s%s " "$(cu_color "${CU_COLOR_LABEL}")" "$_win_label" "$(cu_reset)"
 
-        local spark_short
-        spark_short=$(cu_sparkline_from_history "five_hour" 5 8 "braille" 2>/dev/null || true)
-        [ -n "$spark_short" ] && printf " %s%s%s" "$(cu_color "$CU_DIM")" "$spark_short" "$(cu_reset)"
-
-        if [[ "${CU_ETA_WINDOWS}" == *"five_hour"* ]]; then
-            local eta_info
-            eta_info=$(cu_eta_projection "five_hour" "${CU_ETA_5H_AVG:-3}" 2>/dev/null || true)
-            if [ -n "$eta_info" ]; then
-                local eta_rate eta_hours eta_secs before_reset
-                read -r eta_rate eta_hours eta_secs before_reset <<< "$eta_info"
-                if [ -n "${eta_secs:-}" ] && [ "${eta_secs:-0}" -gt 0 ] 2>/dev/null; then
-                    local eta_str
-                    eta_str=$(cu_fmt_duration "$eta_secs")
-                    if [ "${before_reset:-}" = "1" ]; then
-                        printf " %s~%s%s" "$(cu_color "$CU_RED")" "$eta_str" "$(cu_reset)"
-                    else
-                        printf " %s~%s%s" "$(cu_color "$CU_DIM")" "$eta_str" "$(cu_reset)"
-                    fi
-                fi
+        local _mod first_mod=1
+        for _mod in ${modules//,/ }; do
+            local mod_out=""
+            case "$_mod" in
+                bar)       mod_out=$(_render_mod_bar "$pct_int") ;;
+                pct)       mod_out=$(_render_mod_pct "$_win_pct") ;;
+                sparkline) mod_out=$(_render_mod_sparkline "$_win_field") ;;
+                rate)      mod_out=$(_render_mod_rate "$_win_avg") ;;
+                eta)       mod_out=$(_render_mod_eta) ;;
+                reset)     mod_out=$(_render_mod_reset "$_win_field" "$_win_reset") ;;
+                *) continue ;;
+            esac
+            if [ -n "$mod_out" ]; then
+                [ "$first_mod" = "1" ] && first_mod=0 || printf " "
+                printf "%s" "$mod_out"
             fi
-        fi
+        done
+    done
 
-        if [ -n "$five_reset" ]; then
-            local secs
-            secs=$(cu_secs_until_reset "$five_reset")
-            [ "${secs:-0}" -gt 0 ] 2>/dev/null && printf " %s↻%s%s" "$(cu_color "$CU_DIM")" "$(cu_fmt_duration "$secs")" "$(cu_reset)"
-        fi
-    fi
-
-    # Line 3: 7d group — bar + pct + sparkline + ETA + reset
-    if [ -n "$seven_pct" ]; then
-        printf "\n"
-        printf "%s7d%s %s %s" \
-            "$(cu_color "$CU_DIM")" "$(cu_reset)" \
-            "$(cu_progress_bar "$seven_int" 10)" \
-            "$(cu_fmt_pct "$seven_pct")"
-
-        local spark_long
-        spark_long=$(cu_sparkline_from_history "seven_day" 168 8 "braille" 2>/dev/null || true)
-        [ -n "$spark_long" ] && printf " %s%s%s" "$(cu_color "$CU_DIM")" "$spark_long" "$(cu_reset)"
-
-        if [[ "${CU_ETA_WINDOWS}" == *"seven_day"* ]]; then
-            local eta_info
-            eta_info=$(cu_eta_projection "seven_day" "${CU_ETA_7D_AVG:-24}" 2>/dev/null || true)
-            if [ -n "$eta_info" ]; then
-                local eta_rate eta_hours eta_secs before_reset
-                read -r eta_rate eta_hours eta_secs before_reset <<< "$eta_info"
-                if [ -n "${eta_secs:-}" ] && [ "${eta_secs:-0}" -gt 0 ] 2>/dev/null; then
-                    local eta_str
-                    eta_str=$(cu_fmt_duration "$eta_secs")
-                    if [ "${before_reset:-}" = "1" ]; then
-                        printf " %s~%s%s" "$(cu_color "$CU_RED")" "$eta_str" "$(cu_reset)"
-                    else
-                        printf " %s~%s%s" "$(cu_color "$CU_DIM")" "$eta_str" "$(cu_reset)"
-                    fi
-                fi
-            fi
-        fi
-
-        if [ -n "$seven_reset" ]; then
-            local reset_date
-            reset_date=$(cu_fmt_reset_date "$seven_reset")
-            [ -n "$reset_date" ] && printf " %s↻%s%s" "$(cu_color "$CU_DIM")" "$reset_date" "$(cu_reset)"
-        fi
-    fi
+    # Update notification on its own line
+    local update_msg
+    update_msg=$(cu_update_message)
+    [ -n "$update_msg" ] && printf "\n%s" "$update_msg"
+    return 0
 }

@@ -96,7 +96,8 @@ cu_fmt_duration() {
 cu_fmt_reset_date() {
     local iso="$1"
     [ -z "$iso" ] && return
-    date -d "$iso" "+%b %-d" 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "${iso%%.*}" "+%b %-d" 2>/dev/null
+    # %P = GNU lowercase am/pm; macOS only has %p (uppercase) — pipe through tr for consistency
+    LC_TIME=C date -d "$iso" "+%a %-l%P" 2>/dev/null || LC_TIME=C date -j -f "%Y-%m-%dT%H:%M:%S" "${iso%%.*}" "+%a %-l%p" 2>/dev/null | tr 'AP' 'ap'
 }
 
 # Time until reset in seconds

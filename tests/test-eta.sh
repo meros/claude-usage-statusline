@@ -137,7 +137,7 @@ if [ -n "$eta_info" ]; then
 fi
 
 echo ""
-echo "=== Spiky Data: Moving Average Smoothing ==="
+echo "=== Spiky Data: Wall-Clock Rate ==="
 
 # Create long history with a spike: 10, 50, 15, 20, 25
 > "$CU_HISTORY_LONG"
@@ -149,24 +149,29 @@ for i in 0 1 2 3 4; do
 done
 export CU_NOW=$((local_base + 4 * 3600))
 
-eta_info=$(cu_eta_projection "seven_day" 3 "long" 2>/dev/null)
-assert_nonzero "spiky data produces output" "$eta_info"
+# Window=3h: last 3 hours go from 50→25 (negative net change), no ETA
+eta_info=$(cu_eta_projection "seven_day" 3 "long" 2>/dev/null || true)
+assert_eq "spiky data with negative net change = no ETA" "" "$eta_info"
+
+# Full window: 10→25 over 4 hours = 3.75%/h
+eta_info=$(cu_eta_projection "seven_day" 10 "long" 2>/dev/null)
+assert_nonzero "spiky data full window produces output" "$eta_info"
 
 if [ -n "$eta_info" ]; then
     read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-    assert_range "spiky rate smoothed by moving avg" "10" "20" "$rate"
+    assert_range "wall-clock rate over full window" "3.5" "4.0" "$rate"
 fi
 
 echo ""
 echo "=== Configurable Window Size ==="
 
-# Same spiky data but window=1 (only last positive delta = +5%/h)
+# Window=1h: last hour 20→25 = 5.0%/h
 eta_info=$(cu_eta_projection "seven_day" 1 "long" 2>/dev/null)
 assert_nonzero "window=1 produces output" "$eta_info"
 
 if [ -n "$eta_info" ]; then
     read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-    assert_eq "window=1 rate = last positive delta = 5.0" "5.0" "$rate"
+    assert_eq "window=1 rate = 5.0" "5.0" "$rate"
 fi
 
 echo ""

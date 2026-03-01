@@ -41,6 +41,8 @@ source "${LIB_DIR}/fetch.sh"
 source "${LIB_DIR}/history.sh"
 # shellcheck source=../lib/render.sh
 source "${LIB_DIR}/render.sh"
+# shellcheck source=../lib/update.sh
+source "${LIB_DIR}/update.sh"
 
 # Parse global flags
 CU_OPT_NO_COLOR=""
@@ -51,10 +53,31 @@ CU_OPT_BRAILLE=""
 CU_OPT_MULTILINE=""
 CU_OPT_TIER=""
 
-# ETA defaults (configurable via env vars)
-CU_ETA_WINDOWS="${CU_ETA_WINDOWS:-five_hour,seven_day}"
+# Configurable defaults (override via env vars or CLI flags)
+# CU_ETA_WINDOWS is deprecated — map to CU_WINDOWS for backward compat
+CU_WINDOWS="${CU_WINDOWS:-${CU_ETA_WINDOWS:-five_hour,seven_day}}"
+CU_MODULES="${CU_MODULES:-}"  # default set per mode in statusline
+CU_SPARKLINE_TYPE="${CU_SPARKLINE_TYPE:-braille}"
+CU_BAR_WIDTH="${CU_BAR_WIDTH:-10}"
+
+# ETA defaults
 CU_ETA_5H_AVG="${CU_ETA_5H_AVG:-1}"
 CU_ETA_7D_AVG="${CU_ETA_7D_AVG:-24}"
+
+# Color overrides (users can set these to custom ANSI codes)
+CU_COLOR_SPARKLINE="${CU_COLOR_SPARKLINE:-${CU_PURPLE}}"
+CU_COLOR_RATE="${CU_COLOR_RATE:-${CU_ORANGE}}"
+CU_COLOR_ETA="${CU_COLOR_ETA:-${CU_AQUA}}"
+CU_COLOR_RESET="${CU_COLOR_RESET:-${CU_DIM}}"
+CU_COLOR_RESET_ICON="${CU_COLOR_RESET_ICON:-${CU_PURPLE}}"
+CU_COLOR_LABEL="${CU_COLOR_LABEL:-${CU_DIM}}"
+CU_COLOR_DIR="${CU_COLOR_DIR:-${CU_AQUA}}"
+CU_COLOR_BRANCH="${CU_COLOR_BRANCH:-${CU_GREEN}}"
+CU_COLOR_WARN="${CU_COLOR_WARN:-${CU_RED}}"
+
+# Update check
+CU_UPDATE_CHECK="${CU_UPDATE_CHECK:-1}"
+CU_UPDATE_TTL="${CU_UPDATE_TTL:-3600}"
 
 parse_flags() {
     while [ $# -gt 0 ]; do
@@ -97,9 +120,21 @@ parse_flags() {
             --multiline)
                 CU_OPT_MULTILINE=1
                 ;;
-            --eta-windows)
-                [ $# -ge 2 ] || { echo "Error: --eta-windows requires a value" >&2; return 1; }
-                shift; CU_ETA_WINDOWS="$1"
+            --eta-windows|--windows)
+                [ $# -ge 2 ] || { echo "Error: $1 requires a value" >&2; return 1; }
+                shift; CU_WINDOWS="$1"
+                ;;
+            --modules)
+                [ $# -ge 2 ] || { echo "Error: --modules requires a value" >&2; return 1; }
+                shift; CU_MODULES="$1"
+                ;;
+            --sparkline-type)
+                [ $# -ge 2 ] || { echo "Error: --sparkline-type requires a value (braille or block)" >&2; return 1; }
+                shift; CU_SPARKLINE_TYPE="$1"
+                ;;
+            --bar-width)
+                [ $# -ge 2 ] || { echo "Error: --bar-width requires a number" >&2; return 1; }
+                shift; CU_BAR_WIDTH="$1"
                 ;;
             *)
                 echo "Unknown flag: $1" >&2
@@ -153,7 +188,7 @@ cmd_eta() {
     fi
     local any_output=""
     local _eta_win
-    for _eta_win in ${CU_ETA_WINDOWS//,/ }; do
+    for _eta_win in ${CU_WINDOWS//,/ }; do
         local _eta_field="" _eta_avg="" _eta_label=""
         case "$_eta_win" in
             five_hour) _eta_field="five_hour"; _eta_avg="${CU_ETA_5H_AVG:-3}"; _eta_label="5-Hour Window" ;;
@@ -270,25 +305,46 @@ Commands:
   install-hook  Configure ~/.claude/settings.json
 
 Flags:
-  --no-color    Disable color output
-  --no-fetch    Skip API fetch, use cached data
-  --data-dir    Override data directory
-  --cache-dir   Override cache directory
-  --width N     Sparkline/bar width
-  --hours N     History window in hours
-  --braille     Use compact Braille sparkline (2 data points per char)
-  --multiline   Multi-line statusline (progress bars + sparkline)
-  --eta-windows Comma-separated ETA windows: five_hour,seven_day (default: both)
-  --tier T      History tier: short (5-min, 24h, five_hour) or long (hourly, 1yr, seven_day)
+  --no-color       Disable color output
+  --no-fetch       Skip API fetch, use cached data
+  --data-dir PATH  Override data directory
+  --cache-dir PATH Override cache directory
+  --width N        Sparkline/bar width
+  --hours N        History window in hours
+  --braille        Use compact Braille sparkline (2 data points per char)
+  --multiline      Multi-line statusline (progress bars + sparkline)
+  --windows LIST   Comma-separated windows: five_hour,seven_day (default: both)
+  --modules LIST   Comma-separated modules: bar,pct,sparkline,rate,eta,reset
+  --sparkline-type TYPE  braille (default) or block
+  --bar-width N    Progress bar width (default: 10, multiline only)
+  --tier T         History tier: short (5-min, 24h) or long (hourly, 1yr)
 
-History tiers:
-  short         5-min intervals, 24h retention, five_hour field (session limit)
-  long          Hourly intervals, 1yr retention, seven_day field (weekly limit)
+Modules:
+  bar         Progress bar (multiline only, skipped in single-line)
+  pct         Color-coded percentage
+  sparkline   Braille or block sparkline from history
+  rate        Burn rate per moving average window
+  eta         Time to cap projection
+  reset       Reset countdown or date
 
 Environment:
-  CU_ETA_WINDOWS  ETA windows to show (default: five_hour,seven_day)
-  CU_ETA_5H_AVG   Moving avg window for 5h ETA in hours (default: 1)
-  CU_ETA_7D_AVG   Moving avg window for 7d ETA in hours (default: 24)
+  CU_WINDOWS          Windows to show (default: five_hour,seven_day)
+  CU_MODULES          Modules to show (default: per mode, see docs)
+  CU_SPARKLINE_TYPE   braille or block (default: braille)
+  CU_BAR_WIDTH        Progress bar width (default: 10)
+  CU_ETA_5H_AVG       Moving avg window for 5h ETA in hours (default: 1)
+  CU_ETA_7D_AVG       Moving avg window for 7d ETA in hours (default: 24)
+  CU_COLOR_SPARKLINE  ANSI code for sparkline chars
+  CU_COLOR_RATE       ANSI code for burn rate text
+  CU_COLOR_ETA        ANSI code for ETA duration
+  CU_COLOR_RESET      ANSI code for reset value text
+  CU_COLOR_RESET_ICON ANSI code for reset arrow
+  CU_COLOR_LABEL      ANSI code for 5h/7d labels
+  CU_COLOR_DIR        ANSI code for directory name
+  CU_COLOR_BRANCH     ANSI code for git branch
+  CU_COLOR_WARN       ANSI code for before-reset warning
+  CU_UPDATE_CHECK     Enable update check (default: 1, set 0 to disable)
+  CU_UPDATE_TTL       Update check cache TTL in seconds (default: 3600)
 EOF
 }
 

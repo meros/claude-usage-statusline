@@ -94,6 +94,20 @@ cu_fmt_pct() {
     printf "%s%d%%%s" "$(cu_color "$color")" "$int_pct" "$(cu_reset)"
 }
 
+cu_fmt_rate_per_window() {
+    # Convert %/hour rate to %/avg_window string
+    # Args: rate_per_hour, avg_window_hours
+    local rate="$1" window_hours="${2:-24}"
+    local rate_per_window label
+    rate_per_window=$(awk -v r="$rate" -v w="$window_hours" 'BEGIN { printf "%.0f", r * w }')
+    if [ "$window_hours" -ge 24 ] && [ $((window_hours % 24)) -eq 0 ]; then
+        label="/$(( window_hours / 24 ))d"
+    else
+        label="/${window_hours}h"
+    fi
+    printf "%s%%%s" "$rate_per_window" "$label"
+}
+
 cu_eta_projection() {
     # Calculate ETA to 100% using moving average of positive hourly deltas
     # Args: field (five_hour|seven_day), avg_window (number of recent positive deltas to average), tier (short|long)
@@ -133,25 +147,26 @@ cu_eta_projection() {
         }
         END {
             if (n < 2) exit 1
-            delta_count = 0
-            for (i = 1; i < n; i++) {
-                dt_hours = (ts[i] - ts[i-1]) / 3600
-                if (dt_hours <= 0) continue
-                delta = (val[i] - val[i-1]) / dt_hours
-                if (delta > 0) {
-                    deltas[delta_count] = delta
-                    delta_count++
+
+            # Wall-clock rate: total change over total time for the window
+            # This includes idle periods, giving a realistic calendar ETA
+            total_hours = (ts[n-1] - ts[0]) / 3600
+            if (total_hours <= 0) exit 1
+
+            # Use only the last "window" hours of data
+            win_start = 0
+            if (total_hours > window) {
+                cutoff = ts[n-1] - window * 3600
+                for (i = 0; i < n; i++) {
+                    if (ts[i] >= cutoff) { win_start = i; break }
                 }
             }
-            if (delta_count == 0) exit 1
 
-            use_count = (window < delta_count) ? window : delta_count
-            start = delta_count - use_count
-            sum = 0
-            for (i = start; i < delta_count; i++) {
-                sum += deltas[i]
-            }
-            rate = sum / use_count
+            win_hours = (ts[n-1] - ts[win_start]) / 3600
+            if (win_hours <= 0) exit 1
+            win_change = val[n-1] - val[win_start]
+            if (win_change <= 0) exit 1
+            rate = win_change / win_hours
 
             if (rate <= 0) exit 1
             remaining = 100 - val[n-1]
