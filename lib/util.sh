@@ -100,6 +100,15 @@ cu_fmt_reset_date() {
     LC_TIME=C date -d "$iso" "+%a %-l%P" 2>/dev/null || LC_TIME=C date -j -f "%Y-%m-%dT%H:%M:%S" "${iso%%.*}" "+%a %-l%p" 2>/dev/null | tr 'AP' 'ap'
 }
 
+# Format epoch offset as human-readable date (for ETA display)
+cu_fmt_eta_date() {
+    local secs="$1"
+    local target_epoch
+    target_epoch=$(( $(cu_now) + secs ))
+    LC_TIME=C date -d "@$target_epoch" "+%a %-l%P" 2>/dev/null || \
+    LC_TIME=C date -r "$target_epoch" "+%a %-l%p" 2>/dev/null | tr 'AP' 'ap'
+}
+
 # Time until reset in seconds
 cu_secs_until_reset() {
     local iso="$1"
@@ -109,6 +118,13 @@ cu_secs_until_reset() {
     local now
     now=$(cu_now)
     echo $((reset_epoch - now))
+}
+
+# Visible length of a string after stripping ANSI escape sequences
+cu_visible_len() {
+    local stripped
+    stripped=$(printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g')
+    echo "${#stripped}"
 }
 
 # Round a float to integer

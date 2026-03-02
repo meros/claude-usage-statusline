@@ -81,7 +81,12 @@ cu_view_dashboard() {
             local rate eta_hours eta_secs before_reset
             read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
             if [ -n "${eta_hours:-}" ]; then
-                printf "\n  +%s%%/h | ~%s to cap" "$rate" "$(cu_fmt_duration "${eta_secs:-0}")"
+                local eta_str
+                case "$_win" in
+                    seven_day) eta_str=$(cu_fmt_eta_date "${eta_secs:-0}") ;;
+                    *)         eta_str=$(cu_fmt_duration "${eta_secs:-0}") ;;
+                esac
+                printf "\n  +%s%%/h | ~%s to cap" "$rate" "$eta_str"
                 [ "${before_reset:-}" = "1" ] && printf " | %sBEFORE RESET%s" "$(cu_color "${CU_COLOR_WARN}")" "$(cu_reset)"
             fi
         fi
