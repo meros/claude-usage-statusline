@@ -27,16 +27,16 @@ Claude Code doesn't show how much of your usage limit you've burned until you're
 
 ## What it looks like
 
-**Single-line** (default):
-```
-myproject  main | 5h: 12% | 7d: 42% resets Mar 6 | ▁▂▃▄▅▃▂▄
-```
-
-**Multi-line** (`--multiline`):
+**Multi-line** (`--multiline`) — columns align across windows:
 ```
 myproject  main
-5h ████████░░ 38% ↻ 2h 14m  7d ██████████████████░░ 78% ↻ Mar 6
-▁▂▃▄▅▃▂▄▅▆▇▆▇  ~1d 3h to cap
+5h ██░░░░░░░░  35%  .:.. ..::: 11%/1h ~6h 13m  ↻ 5m
+7d ████░░░░░░  39%       :..::: 17%/1d ~Fri 9am ↻ Fri 6am
+```
+
+**Single-line** (default):
+```
+myproject  main | 5h: 35% .:.. 11%/1h ~6h 13m ↻ 5m | 7d: 39% :..::: 17%/1d ~Fri 9am ↻ Fri 6am
 ```
 
 **Dashboard** (`claude-usage show`):
@@ -48,23 +48,24 @@ Claude Usage
   ████████░░░░░░░░░░░░  38%    resets in 2h 14m
 
 7-Day Window
-  ████████████████░░░░  78%    resets Mar 6 (5d 3h)
+  ████████████████░░░░  78%    resets Fri 6am
 
   Hourly (last 7 days):
   ▁▁▂▂▃▃▅▅██▅▅▃▃▂▂▁▁▂▂▃▃▄▄▅▅▆▆▇▇████▇▇▅▅▃▃
 
-Projection: +4.2%/h | ~1d 3h to 100% | BEFORE RESET
+Projection: +4.2%/h | ~Fri 3pm to 100% | BEFORE RESET
 ```
 
-Colors: green <50%, yellow 50-80%, red >80%. Gruvbox palette.
+Colors are Gruvbox-inspired: green (<50%), yellow (50-80%), red (>80%). Rates are orange, ETAs are aqua, sparklines and reset icons are purple, labels and reset times are dim.
 
 ## Features
 
 - **5-hour and 7-day windows** — color-coded usage with reset countdown
+- **Column-aligned multiline** — progress bars, sparklines, rates, ETAs, and resets align across windows
+- **Smart ETA format** — 5h window shows duration (`~6h 13m`), 7d window shows date (`~Fri 9am`)
 - **Dual-tier history** — short tier (5-min intervals, 24h) for session tracking, long tier (hourly, 1yr) for weekly trends
 - **Sparkline trends** — standard blocks (`▁▂▃▄▅▆▇█`) or compact Braille mode
 - **ETA projection** — predicts when you'll hit 100%, warns if before reset
-- **Multi-line statusline** — progress bars, sparkline, and ETA in your Claude Code status
 - **Rich dashboard** — full terminal view with `claude-usage show`
 - **Configurable modules** — choose which info to show and in what order
 - **Update notifications** — see when a new version is available
@@ -151,8 +152,8 @@ Controls which information modules appear and in what order.
 | `pct` | Color-coded percentage |
 | `sparkline` | Braille or block sparkline from history |
 | `rate` | Burn rate per moving average window |
-| `eta` | Time to cap projection |
-| `reset` | Reset countdown or date |
+| `eta` | Time to cap (duration for 5h, date for 7d) |
+| `reset` | Reset countdown (5h) or reset date (7d) with ↻ icon |
 
 Defaults: `pct,sparkline,rate,eta,reset` (single-line), `bar,pct,sparkline,rate,eta,reset` (multiline).
 
@@ -174,9 +175,9 @@ Override any color with a custom ANSI code:
 |----------|---------|-------------|
 | `CU_COLOR_SPARKLINE` | purple | Sparkline characters |
 | `CU_COLOR_RATE` | orange | Burn rate text |
-| `CU_COLOR_ETA` | aqua | ETA duration |
+| `CU_COLOR_ETA` | aqua | ETA duration/date |
 | `CU_COLOR_RESET` | dim | Reset value text |
-| `CU_COLOR_RESET_ICON` | purple | Reset arrow (↻) |
+| `CU_COLOR_RESET_ICON` | purple | Reset icon (↻) |
 | `CU_COLOR_LABEL` | dim | Window labels (5h/7d) |
 | `CU_COLOR_DIR` | aqua | Directory name |
 | `CU_COLOR_BRANCH` | green | Git branch |
