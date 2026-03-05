@@ -32,8 +32,9 @@ cu_view_statusline() {
     data=$(cu_read_cache)
 
     # Parse usage data once
-    local five_pct="" seven_pct="" five_reset="" seven_reset=""
+    local five_pct="" seven_pct="" five_reset="" seven_reset="" cache_error=""
     if [ -n "$data" ]; then
+        cache_error=$(echo "$data" | jq -r '._error // empty' 2>/dev/null)
         five_pct=$(cu_get_five_hour_pct "$data")
         seven_pct=$(cu_get_seven_day_pct "$data")
         five_reset=$(cu_get_five_hour_reset "$data")
@@ -195,7 +196,9 @@ _statusline_single() {
 
     # Build usage section
     local usage_section=""
-    if [ -n "$data" ]; then
+    if [ -n "$cache_error" ]; then
+        usage_section=" $(cu_color "$CU_DIM")rate limited, retrying soon$(cu_reset)"
+    elif [ -n "$data" ]; then
         local parts=()
         local _win
         for _win in ${CU_WINDOWS//,/ }; do
@@ -266,7 +269,19 @@ _statusline_multiline() {
         printf "%s%s%s" "$(cu_color "${CU_COLOR_DIR}")" "$cwd_basename" "$(cu_reset)"
     fi
 
-    [ -z "$data" ] && return 0
+    if [ -z "$data" ]; then return 0; fi
+
+    if [ -n "$cache_error" ]; then
+        local retry_at detail="retrying soon"
+        retry_at=$(echo "$data" | jq -r '._retry_at // empty' 2>/dev/null)
+        if [ -n "$retry_at" ]; then
+            local secs_left=$(( retry_at - $(cu_now) ))
+            [ "$secs_left" -gt 0 ] && detail="retry in $(cu_fmt_duration "$secs_left")"
+        fi
+        printf '\n%sAPI rate limited, %s%s' \
+            "$(cu_color "$CU_DIM")" "$detail" "$(cu_reset)"
+        return 0
+    fi
 
     # Build module list as array for indexed access
     local mod_list=()

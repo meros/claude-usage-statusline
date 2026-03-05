@@ -118,11 +118,26 @@ cu_fetch() {
     fi
 
     # Try to extract API error message
-    local api_err
+    local api_err err_type
     api_err=$(echo "$resp" | jq -r '.error.message // empty' 2>/dev/null)
+    err_type=$(echo "$resp" | jq -r '.error.type // empty' 2>/dev/null)
     if [ -n "$api_err" ]; then
         cu_log "fetch: API error: $api_err"
         echo "API error: $api_err" >&2
+        # On rate limit, touch existing cache to prevent hammering the API.
+        # If no cache exists, write a minimal sentinel.
+        if [ "$err_type" = "rate_limit_error" ]; then
+            if [ -f "$CU_CACHE_FILE" ]; then
+                cu_log "fetch: rate limited, refreshing cache mtime"
+                touch "$CU_CACHE_FILE"
+            else
+                cu_log "fetch: rate limited, writing backoff sentinel"
+                local retry_at=$(($(cu_now) + CU_CACHE_MAX_AGE))
+                local tmp="${CU_CACHE_FILE}.tmp.$$"
+                printf '{"_error":"rate_limited","_retry_at":%d}\n' "$retry_at" > "$tmp"
+                mv "$tmp" "$CU_CACHE_FILE"
+            fi
+        fi
     else
         cu_log "fetch: unexpected response: ${resp:0:200}"
         echo "Unexpected API response (no usage data). Token may be expired — try restarting Claude Code." >&2

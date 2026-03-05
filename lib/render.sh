@@ -112,8 +112,6 @@ cu_eta_projection() {
     # Calculate ETA to 100% using moving average of positive hourly deltas
     # Args: field (five_hour|seven_day), avg_window (number of recent positive deltas to average), tier (short|long)
     local field="${1:-seven_day}" avg_window="${2:-24}" tier="${3:-}"
-    local values=()
-    local timestamps=()
 
     # Prefer short tier (fine-grained 5-min data) for accurate rate calculation
     # Fall back to long tier if short tier lacks sufficient data
@@ -123,40 +121,27 @@ cu_eta_projection() {
         auto_tier=1
     fi
 
-    # Read enough history to cover the averaging window
+    # Single jq call: extract ts, val, resets_at as TSV (replaces per-line jq loop)
     local read_hours=$((avg_window + 1))
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        local ts val
-        ts=$(echo "$line" | jq -r '.ts' 2>/dev/null)
-        val=$(echo "$line" | jq -r ".$field.util" 2>/dev/null)
-        [ -n "$ts" ] && [ -n "$val" ] && timestamps+=("$ts") && values+=("$val")
-    done < <(cu_history_read "$tier" "$read_hours")
+    local tsv_data
+    tsv_data=$(cu_history_read "$tier" "$read_hours" | \
+        jq -r --arg f "$field" '
+            select(.[$f] != null and .[$f].util != null) |
+            [.ts, .[$f].util, (.[$f].resets_at // "")] | @tsv' 2>/dev/null)
 
-    local n=${#values[@]}
-    if [ "$n" -lt 2 ]; then
-        # Fall back to long tier if short tier lacks data
-        if [ "$auto_tier" = "1" ] && [ "$tier" = "short" ]; then
-            cu_eta_projection "$field" "$avg_window" "long"
-            return $?
-        fi
-        return 1
-    fi
-
-    # Build ts/val input for awk, then compute moving average of positive deltas
+    # Compute rate with awk (same algorithm, fed from single jq call)
     local result
-    result=$(_cu_eta_build_input | \
-        awk -v window="$avg_window" '
-        {
-            ts[NR-1] = $1
-            val[NR-1] = $2
-            n = NR
+    result=$(printf '%s\n' "$tsv_data" | awk -F'\t' -v window="$avg_window" '
+        BEGIN { n = 0 }
+        NF >= 2 {
+            ts[n] = $1 + 0
+            val[n] = $2 + 0
+            n++
         }
         END {
             if (n < 2) exit 1
 
             # Wall-clock rate: total change over total time for the window
-            # This includes idle periods, giving a realistic calendar ETA
             total_hours = (ts[n-1] - ts[0]) / 3600
             if (total_hours <= 0) exit 1
 
@@ -183,7 +168,6 @@ cu_eta_projection() {
             printf "%.1f %.1f %d", rate, hours_to_cap, secs_to_cap
         }' 2>/dev/null)
     if [ -z "$result" ]; then
-        # Fall back to long tier if short tier rate calculation failed
         if [ "$auto_tier" = "1" ] && [ "$tier" = "short" ]; then
             cu_eta_projection "$field" "$avg_window" "long"
             return $?
@@ -194,9 +178,9 @@ cu_eta_projection() {
     local rate hours_to_cap secs_to_cap
     read -r rate hours_to_cap secs_to_cap <<< "$result"
 
-    # Check if before reset
+    # Extract resets_at from last TSV line (no extra jq call)
     local reset_at
-    reset_at=$(cu_history_read "$tier" "$read_hours" | tail -1 | jq -r ".$field.resets_at // empty" 2>/dev/null)
+    reset_at=$(printf '%s\n' "$tsv_data" | tail -1 | cut -f3)
     local before_reset=""
     if [ -n "$reset_at" ]; then
         local secs_to_reset
@@ -208,56 +192,6 @@ cu_eta_projection() {
 
     # Output: space-delimited "rate hours secs before_reset_flag"
     printf "%s %s %s %s\n" "$rate" "$hours_to_cap" "$secs_to_cap" "${before_reset:+1}"
-}
-
-_cu_interpolate() {
-    # Linear interpolation at timestamp $1 using rec_ts/rec_val arrays from caller
-    # Does NOT interpolate across reset boundaries (value drops > 5%)
-    local t="$1"
-    local n=${#rec_ts[@]}
-    [ "$n" -eq 0 ] && return
-
-    # Before first point
-    [ "$t" -le "${rec_ts[0]}" ] && echo "${rec_val[0]}" && return
-    # After last point
-    [ "$t" -ge "${rec_ts[$((n-1))]}" ] && echo "${rec_val[$((n-1))]}" && return
-
-    # Find surrounding points
-    local j
-    for ((j=1; j<n; j++)); do
-        if [ "$t" -le "${rec_ts[$j]}" ]; then
-            local t0="${rec_ts[$((j-1))]}" t1="${rec_ts[$j]}"
-            local v0="${rec_val[$((j-1))]}" v1="${rec_val[$j]}"
-            if [ "$t0" -eq "$t1" ]; then
-                echo "$v0"
-            else
-                # Check for reset between these points (value drop > 5%)
-                local is_reset
-                is_reset=$(awk "BEGIN { print ($v1 - $v0 < -5) ? 1 : 0 }")
-                if [ "$is_reset" = "1" ]; then
-                    # Don't interpolate across reset — snap to nearest side
-                    local mid=$(( (t0 + t1) / 2 ))
-                    if [ "$t" -le "$mid" ]; then
-                        echo "$v0"
-                    else
-                        echo "$v1"
-                    fi
-                else
-                    awk "BEGIN { printf \"%.1f\", $v0 + ($v1-$v0) * ($t-$t0) / ($t1-$t0) }"
-                fi
-            fi
-            return
-        fi
-    done
-}
-
-_cu_eta_build_input() {
-    # Helper: outputs "timestamp value" lines from the values/timestamps arrays
-    # These arrays are set by the calling cu_eta_projection function
-    local i
-    for ((i=0; i<${#timestamps[@]}; i++)); do
-        printf "%s %s\n" "${timestamps[$i]}" "${values[$i]}"
-    done
 }
 
 cu_braille_sparkline() {
@@ -341,69 +275,105 @@ cu_sparkline_from_history() {
     local data_points="$width"
     [ "$compact" = "braille" ] && data_points=$((width * 2))
 
-    # Read timestamped records and bucket into fixed time slots
-    # Each slot covers (hours*3600/data_points) seconds
     local now
     now=$(cu_now)
     local window_start=$((now - hours * 3600))
     local slot_secs=$(( (hours * 3600) / data_points ))
 
-    # Read all records with timestamps, values, and resets_at
-    local -a rec_ts=() rec_val=() rec_reset=()
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        local ts val ra
-        ts=$(echo "$line" | jq -r '.ts' 2>/dev/null)
-        val=$(echo "$line" | jq -r ".$field.util" 2>/dev/null)
-        ra=$(echo "$line" | jq -r ".$field.resets_at // empty" 2>/dev/null)
-        [ -z "$ts" ] || [ -z "$val" ] || [ "$val" = "null" ] && continue
-        rec_ts+=("$ts")
-        rec_val+=("$val")
-        rec_reset+=("$ra")
-    done < <(cu_history_read "$tier" "$hours")
+    # Single pipeline: jq extracts TSV (ts, val, resets_at_epoch), awk does
+    # interpolation, delta computation, and reset detection in one pass
+    local awk_output
+    awk_output=$(cu_history_read "$tier" "$hours" | \
+        jq -r --arg f "$field" '
+            select(.[$f] != null and .[$f].util != null) |
+            ((.[$f].resets_at // "") | if . == "" then 0
+             else (sub("[.+Z].*$"; "Z") | fromdateiso8601) // 0 end) as $ra_epoch |
+            [.ts, .[$f].util, $ra_epoch] | @tsv' 2>/dev/null | \
+        awk -F'\t' -v win_start="$window_start" -v slot_secs="$slot_secs" -v dp="$data_points" '
+        BEGIN { n = 0 }
+        function interp(t,    j, t0, t1, v0, v1, mid) {
+            if (n == 0) return -1
+            if (t <= ts[0]) return val[0]
+            if (t >= ts[n-1]) return val[n-1]
+            for (j = 1; j < n; j++) {
+                if (t <= ts[j]) {
+                    t0 = ts[j-1]; t1 = ts[j]
+                    v0 = val[j-1]; v1 = val[j]
+                    if (t0 == t1) return v0
+                    # Reset boundary: value drop > 5% — snap to nearest side
+                    if (v1 - v0 < -5) {
+                        mid = int((t0 + t1) / 2)
+                        return (t <= mid) ? v0 : v1
+                    }
+                    return v0 + (v1 - v0) * (t - t0) / (t1 - t0)
+                }
+            }
+            return val[n-1]
+        }
+        {
+            ts[n] = $1 + 0
+            val[n] = $2 + 0
+            ra[n] = $3 + 0
+            n++
+        }
+        END {
+            if (n == 0) exit 1
 
-    [ ${#rec_ts[@]} -eq 0 ] && return
+            # Detect reset slots from resets_at epoch jumps (>300s forward)
+            prev_ra = 0
+            rc = 0
+            for (i = 0; i < n; i++) {
+                if (ra[i] == 0) continue
+                if (prev_ra > 0 && ra[i] > prev_ra + 300) {
+                    rslot = int((prev_ra - win_start) / slot_secs)
+                    if (rslot >= 0 && rslot < dp) resets[rc++] = rslot
+                }
+                prev_ra = ra[i]
+            }
 
-    # Detect reset times from resets_at field changes
-    # A reset occurred when the resets_at epoch jumps forward (new window started)
-    local -a reset_slots=()
-    local prev_reset_epoch=""
-    for ((i=0; i<${#rec_ts[@]}; i++)); do
-        [ -z "${rec_reset[$i]}" ] && continue
-        local reset_epoch
-        reset_epoch=$(date -d "${rec_reset[$i]}" +%s 2>/dev/null || \
-                      date -j -f "%Y-%m-%dT%H:%M:%S" "${rec_reset[$i]%%.*}" +%s 2>/dev/null) || continue
-        if [ -n "$prev_reset_epoch" ] && [ "$reset_epoch" -gt "$((prev_reset_epoch + 300))" ]; then
-            # Reset happened at the old resets_at time — place marker there
-            local rslot=$(( (prev_reset_epoch - window_start) / slot_secs ))
-            [ "$rslot" -ge 0 ] && [ "$rslot" -lt "$data_points" ] && reset_slots+=("$rslot")
-        fi
-        prev_reset_epoch="$reset_epoch"
-    done
+            # Interpolate at slot boundaries and compute per-slot deltas
+            for (i = 0; i < dp; i++) {
+                s0 = win_start + i * slot_secs
+                s1 = s0 + slot_secs
+                v_s = interp(s0)
+                v_e = interp(s1)
+                if (v_s >= 0 && v_e >= 0) {
+                    d = int(v_e - v_s)
+                    deltas[i] = (d < 0) ? 0 : d
+                } else {
+                    deltas[i] = 0
+                }
+            }
 
-    # Interpolate a value at each slot boundary, then compute per-slot deltas
-    # This distributes change evenly across gaps instead of spiking
+            # Line 1: space-separated deltas
+            for (i = 0; i < dp; i++) {
+                if (i > 0) printf " "
+                printf "%d", deltas[i]
+            }
+            printf "\n"
+            # Line 2: space-separated reset slot indices
+            for (i = 0; i < rc; i++) {
+                if (i > 0) printf " "
+                printf "%d", resets[i]
+            }
+            printf "\n"
+        }')
+
+    [ -z "$awk_output" ] && return
+
+    # Parse deltas and reset slots from awk output
+    local deltas_line reset_line
+    deltas_line=$(printf '%s\n' "$awk_output" | head -1)
+    reset_line=$(printf '%s\n' "$awk_output" | sed -n '2p')
+
     local -a deltas=()
-    for ((i=0; i<data_points; i++)); do
-        local slot_start=$((window_start + i * slot_secs))
-        local slot_end=$((slot_start + slot_secs))
-        # Interpolate values at slot_start and slot_end
-        local v_start v_end
-        v_start=$(_cu_interpolate "$slot_start")
-        v_end=$(_cu_interpolate "$slot_end")
-        if [ -n "$v_start" ] && [ -n "$v_end" ]; then
-            local d
-            d=$(awk "BEGIN { d=int($v_end - $v_start); print (d<0) ? 0 : d }")
-            deltas+=("$d")
-        else
-            deltas+=(0)
-        fi
-    done
-
+    read -ra deltas <<< "$deltas_line"
     [ ${#deltas[@]} -eq 0 ] && return
 
+    local -a reset_slots=()
+    [ -n "$reset_line" ] && read -ra reset_slots <<< "$reset_line"
+
     if [ "$compact" = "braille" ] && [ ${#reset_slots[@]} -gt 0 ]; then
-        # Render braille with reset markers: replace chars at reset positions with ↻
         _cu_braille_with_resets
     elif [ "$compact" = "braille" ]; then
         cu_braille_sparkline "${deltas[@]}"
