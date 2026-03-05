@@ -71,7 +71,11 @@ cu_view_dashboard() {
                     printf "%s" "$(cu_reset)"
                 fi
             else
-                [ "$secs" -gt 0 ] 2>/dev/null && printf "    %sresets in %s%s" "$(cu_color "${CU_COLOR_RESET}")" "$(cu_fmt_duration "$secs")" "$(cu_reset)"
+                if [ "${secs:-0}" -gt 0 ] 2>/dev/null; then
+                    printf "    %sresets in %s%s" "$(cu_color "${CU_COLOR_RESET}")" "$(cu_fmt_duration "$secs")" "$(cu_reset)"
+                else
+                    printf "    %sresets now%s" "$(cu_color "${CU_COLOR_RESET}")" "$(cu_reset)"
+                fi
             fi
         fi
 

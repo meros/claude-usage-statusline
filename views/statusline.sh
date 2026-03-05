@@ -81,7 +81,7 @@ _render_mod_sparkline() {
     # Normalize: anything not "block" becomes "braille"
     [ "$spark_mode" != "block" ] && spark_mode="braille"
     local spark
-    spark=$(cu_sparkline_from_history "$field" "$spark_hours" 8 "$spark_mode" "$spark_tier" 2>/dev/null || true)
+    spark=$(cu_sparkline_from_history "$field" "$spark_hours" 16 "$spark_mode" "$spark_tier" 2>/dev/null || true)
     [ -n "$spark" ] && printf '%s%s%s' "$(cu_color "${CU_COLOR_SPARKLINE}")" "$spark" "$(cu_reset)"
     return 0
 }
@@ -102,6 +102,7 @@ _render_mod_rate() {
 _render_mod_eta() {
     # Uses shared _eta_secs, _before_reset from _compute_eta
     # Args: field (five_hour|seven_day) — determines duration vs date format
+    # When no projection available (rate=0, no data): hide entirely — reset module still shows
     local field="${1:-}"
     [ -z "${_eta_secs:-}" ] && return 0
     [ "${_eta_secs:-0}" -le 0 ] 2>/dev/null && return 0
@@ -127,7 +128,11 @@ _render_mod_reset() {
         five_hour)
             local secs
             secs=$(cu_secs_until_reset "$reset_time")
-            [ "${secs:-0}" -gt 0 ] 2>/dev/null && reset_str=$(cu_fmt_duration "$secs")
+            if [ "${secs:-0}" -gt 0 ] 2>/dev/null; then
+                reset_str=$(cu_fmt_duration "$secs")
+            else
+                reset_str="now"
+            fi
             ;;
         seven_day)
             reset_str=$(cu_fmt_reset_date "$reset_time")

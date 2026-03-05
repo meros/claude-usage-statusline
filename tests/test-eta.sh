@@ -213,7 +213,7 @@ local_base=1700000000
 for i in 0 1 2 3 4; do
     ts=$((local_base + i * 3600))
     val=$((10 + i * 5))
-    echo "{\"ts\":$ts,\"five_hour\":{\"util\":$val,\"resets_at\":\"\"}}" >> "$CU_HISTORY_SHORT"
+    echo "{\"ts\":$ts,\"five_hour\":{\"util\":$val,\"resets_at\":\"\"},\"seven_day\":{\"util\":$val,\"resets_at\":\"\"}}" >> "$CU_HISTORY_SHORT"
     echo "{\"ts\":$ts,\"seven_day\":{\"util\":$val,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
 done
 export CU_NOW=$((local_base + 4 * 3600))
@@ -222,13 +222,33 @@ export CU_NOW=$((local_base + 4 * 3600))
 eta_info=$(cu_eta_projection "five_hour" 10 2>/dev/null)
 assert_nonzero "five_hour defaults to short tier" "$eta_info"
 
-# seven_day should default to long tier
+# seven_day should also default to short tier (fine-grained data for ETA)
 eta_info=$(cu_eta_projection "seven_day" 10 2>/dev/null)
-assert_nonzero "seven_day defaults to long tier" "$eta_info"
+assert_nonzero "seven_day defaults to short tier" "$eta_info"
 
 # Cross-check: five_hour from long tier should fail (no data)
 eta_info=$(cu_eta_projection "five_hour" 10 "long" 2>/dev/null || true)
 assert_eq "five_hour from long tier has no data" "" "$eta_info"
+
+echo ""
+echo "=== Short-to-Long Tier Fallback ==="
+
+# When short tier has no seven_day data, should fall back to long tier
+> "$CU_HISTORY_SHORT"
+> "$CU_HISTORY_LONG"
+local_base=1700000000
+for i in 0 1 2 3 4; do
+    ts=$((local_base + i * 3600))
+    val=$((10 + i * 5))
+    # Short tier has only five_hour (simulates pre-upgrade data)
+    echo "{\"ts\":$ts,\"five_hour\":{\"util\":$val,\"resets_at\":\"\"}}" >> "$CU_HISTORY_SHORT"
+    echo "{\"ts\":$ts,\"seven_day\":{\"util\":$val,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+done
+export CU_NOW=$((local_base + 4 * 3600))
+
+# seven_day should fall back to long tier when short has no seven_day data
+eta_info=$(cu_eta_projection "seven_day" 10 2>/dev/null)
+assert_nonzero "seven_day falls back to long tier" "$eta_info"
 
 echo ""
 echo "=== Duration Formatting ==="

@@ -45,6 +45,8 @@ cu_resolve_token() {
     return 1
 }
 
+CU_FETCH_LOCK="${CU_CACHE_DIR}/fetch.lock"
+
 cu_fetch() {
     local force="${1:-}"
     if [ "$force" != "force" ] && cu_cache_is_fresh; then
@@ -52,9 +54,38 @@ cu_fetch() {
         return 0
     fi
 
+    # Acquire lock so multiple instances don't race for the API
+    # Use fd 9 for the lock to avoid conflicts with other file descriptors
+    local lock_acquired=""
+    exec 9>"$CU_FETCH_LOCK"
+    if flock -n 9 2>/dev/null; then
+        lock_acquired=1
+    else
+        # Another process is fetching — wait briefly then use its result
+        cu_log "fetch: waiting for another process to finish fetching"
+        flock -w 10 9 2>/dev/null || true
+        exec 9>&-
+        # Re-check cache — the other process should have refreshed it
+        if cu_cache_is_fresh; then
+            cu_log "fetch: cache refreshed by another process"
+            return 0
+        fi
+        # Other process may have failed — try fetching ourselves
+        exec 9>"$CU_FETCH_LOCK"
+        flock -n 9 2>/dev/null || { exec 9>&-; return 1; }
+        lock_acquired=1
+    fi
+
+    # Double-check cache after acquiring lock (another process may have just finished)
+    if [ "$force" != "force" ] && cu_cache_is_fresh; then
+        cu_log "fetch: cache refreshed while waiting for lock"
+        exec 9>&-
+        return 0
+    fi
+
     cu_log "fetch: resolving token"
     local token
-    token=$(cu_resolve_token) || return 1
+    token=$(cu_resolve_token) || { exec 9>&-; return 1; }
 
     cu_log "fetch: calling API"
     local resp
@@ -64,6 +95,9 @@ cu_fetch() {
         -H "Authorization: Bearer $token" \
         -H "anthropic-beta: oauth-2025-04-20" \
         "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
+
+    # Release lock
+    exec 9>&-
 
     if [ -z "$resp" ]; then
         cu_log "fetch: empty response (network error or timeout)"
@@ -76,7 +110,10 @@ cu_fetch() {
     # Accept response if it has at least one usage window (five_hour or seven_day)
     if echo "$resp" | jq -e '.five_hour // .seven_day' >/dev/null 2>&1; then
         cu_log "fetch: valid usage data, writing cache"
-        echo "$resp" > "$CU_CACHE_FILE"
+        # Atomic write: write to temp file then rename
+        local tmp="${CU_CACHE_FILE}.tmp.$$"
+        echo "$resp" > "$tmp"
+        mv "$tmp" "$CU_CACHE_FILE"
         return 0
     fi
 

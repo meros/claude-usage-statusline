@@ -261,6 +261,169 @@ cmd_history() {
     fi
 }
 
+cmd_history_view() {
+    parse_flags "$@"
+
+    local now
+    now=$(cu_now)
+
+    # --- Helper: render a table from a JSONL file ---
+    _hv_render_table() {
+        local file="$1" hours="$2" show_five="$3"
+        local cutoff=$((now - hours * 3600))
+
+        [ -f "$file" ] || return 0
+
+        # Header
+        printf "%s%-20s" "$(cu_color "$CU_DIM")" "Time"
+        if [ "$show_five" = "1" ]; then
+            printf "  %-8s  %-8s  %-8s" "5h %" "Δ 5h" "7d %"
+        else
+            printf "  %-8s" "7d %"
+        fi
+        printf "  Change%s\n" "$(cu_reset)"
+
+        printf "%s" "$(cu_color "$CU_DIM")"
+        if [ "$show_five" = "1" ]; then
+            printf "%-20s  %-8s  %-8s  %-8s  %-6s" "────────────────────" "────────" "────────" "────────" "──────"
+        else
+            printf "%-20s  %-8s  %-6s" "────────────────────" "────────" "──────"
+        fi
+        printf "%s\n" "$(cu_reset)"
+
+        local prev_five="" prev_seven=""
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            local ts
+            ts=$(echo "$line" | jq -r '.ts' 2>/dev/null)
+            [ -z "$ts" ] && continue
+
+            local time_str
+            time_str=$(date -d "@$ts" "+%b %d %H:%M" 2>/dev/null || date -r "$ts" "+%b %d %H:%M" 2>/dev/null)
+
+            local seven_val
+            seven_val=$(echo "$line" | jq -r '.seven_day.util // empty' 2>/dev/null)
+
+            if [ "$show_five" = "1" ]; then
+                local five_val
+                five_val=$(echo "$line" | jq -r '.five_hour.util // empty' 2>/dev/null)
+
+                local five_colored seven_colored five_delta="" seven_delta=""
+                local five_reset="" seven_reset_flag=""
+                if [ -n "$five_val" ]; then
+                    five_colored=$(cu_fmt_pct "${five_val%.*}")
+                    if [ -n "$prev_five" ]; then
+                        local fd
+                        fd=$(awk "BEGIN { printf \"%.1f\", $five_val - $prev_five }")
+                        if awk "BEGIN { exit ($fd < -5) ? 0 : 1 }"; then
+                            five_delta="↻"
+                            five_reset="1"
+                        else
+                            five_delta=$(awk "BEGIN { printf \"%+.1f%%\", $fd }")
+                        fi
+                    fi
+                    prev_five="$five_val"
+                else
+                    five_colored="$(cu_color "$CU_DIM")--$(cu_reset)"
+                fi
+                if [ -n "$seven_val" ]; then
+                    seven_colored=$(cu_fmt_pct "${seven_val%.*}")
+                    if [ -n "$prev_seven" ]; then
+                        local sd
+                        sd=$(awk "BEGIN { printf \"%.1f\", $seven_val - $prev_seven }")
+                        if awk "BEGIN { exit ($sd < -5) ? 0 : 1 }"; then
+                            seven_delta="↻"
+                            seven_reset_flag="1"
+                        else
+                            seven_delta=$(awk "BEGIN { printf \"%+.1f%%\", $sd }")
+                        fi
+                    fi
+                    prev_seven="$seven_val"
+                else
+                    seven_colored="$(cu_color "$CU_DIM")--$(cu_reset)"
+                fi
+
+                printf "%-20s  " "$time_str"
+                _hv_pad "$five_colored" 8
+                local five_delta_color="$CU_AQUA"
+                [ "$five_reset" = "1" ] && five_delta_color="$CU_COLOR_RESET_ICON"
+                printf "  %s%s%s" "$(cu_color "$five_delta_color")" "$(printf '%-8s' "${five_delta:- }")" "$(cu_reset)"
+                printf "  "
+                _hv_pad "$seven_colored" 8
+                local seven_delta_color="$CU_AQUA"
+                [ "$seven_reset_flag" = "1" ] && seven_delta_color="$CU_COLOR_RESET_ICON"
+                printf "  %s%s%s\n" "$(cu_color "$seven_delta_color")" "${seven_delta:- }" "$(cu_reset)"
+            else
+                local seven_colored="" seven_delta="" seven_reset_flag=""
+                if [ -n "$seven_val" ]; then
+                    seven_colored=$(cu_fmt_pct "${seven_val%.*}")
+                    if [ -n "$prev_seven" ]; then
+                        local sd
+                        sd=$(awk "BEGIN { printf \"%.1f\", $seven_val - $prev_seven }")
+                        if awk "BEGIN { exit ($sd < -5) ? 0 : 1 }"; then
+                            seven_delta="↻"
+                            seven_reset_flag="1"
+                        else
+                            seven_delta=$(awk "BEGIN { printf \"%+.1f%%\", $sd }")
+                        fi
+                    fi
+                    prev_seven="$seven_val"
+                else
+                    seven_colored="$(cu_color "$CU_DIM")--$(cu_reset)"
+                fi
+
+                printf "%-20s  " "$time_str"
+                _hv_pad "$seven_colored" 8
+                local seven_delta_color="$CU_AQUA"
+                [ "$seven_reset_flag" = "1" ] && seven_delta_color="$CU_COLOR_RESET_ICON"
+                printf "  %s%s%s\n" "$(cu_color "$seven_delta_color")" "${seven_delta:- }" "$(cu_reset)"
+            fi
+        done < <(jq -c --argjson cutoff "$cutoff" 'select(.ts >= $cutoff)' "$file" 2>/dev/null)
+    }
+
+    # Helper: print colored string then pad to width
+    _hv_pad() {
+        printf "%s" "$1"
+        local vlen
+        vlen=$(cu_visible_len "$1")
+        [ "$vlen" -lt "$2" ] && printf "%*s" $(($2 - vlen)) ""
+    }
+
+    # --- Short tier (recent, fine-grained) ---
+    if [ -f "$CU_HISTORY_SHORT" ]; then
+        local short_hours="${CU_OPT_HOURS:-36}"
+        printf "%s━━━ Recent (5-min intervals, last %sh) ━━━%s\n" \
+            "$(cu_color "$CU_FG")" "$short_hours" "$(cu_reset)"
+        _hv_render_table "$CU_HISTORY_SHORT" "$short_hours" "1"
+
+        echo ""
+        printf "%sBurn rate (5h): %s" "$(cu_color "$CU_DIM")" "$(cu_reset)"
+        local spark5
+        spark5=$(cu_sparkline_from_history "five_hour" "$short_hours" 40 "braille" "short" 2>/dev/null || true)
+        printf "%s%s%s\n" "$(cu_color "$CU_COLOR_SPARKLINE")" "${spark5:-  (no data)}" "$(cu_reset)"
+    fi
+
+    # --- Long tier (historical, hourly) ---
+    if [ -f "$CU_HISTORY_LONG" ]; then
+        local long_hours="${CU_OPT_HOURS:-168}"
+        [ -f "$CU_HISTORY_SHORT" ] && echo ""
+        printf "%s━━━ History (hourly, last %sd) ━━━%s\n" \
+            "$(cu_color "$CU_FG")" "$((long_hours / 24))" "$(cu_reset)"
+        _hv_render_table "$CU_HISTORY_LONG" "$long_hours" "0"
+
+        echo ""
+        printf "%sBurn rate (7d): %s" "$(cu_color "$CU_DIM")" "$(cu_reset)"
+        local spark7
+        spark7=$(cu_sparkline_from_history "seven_day" "$long_hours" 40 "braille" "long" 2>/dev/null || true)
+        printf "%s%s%s\n" "$(cu_color "$CU_COLOR_SPARKLINE")" "${spark7:-  (no data)}" "$(cu_reset)"
+    fi
+
+    if [ ! -f "$CU_HISTORY_SHORT" ] && [ ! -f "$CU_HISTORY_LONG" ]; then
+        echo "No history yet. Run 'claude-usage fetch' to start recording." >&2
+        return 1
+    fi
+}
+
 cmd_install_hook() {
     parse_flags "$@"
     local settings_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
@@ -302,6 +465,7 @@ Commands:
   eta           ETA projection line
   fetch         Force-fetch + record history
   history       Dump raw JSONL history
+  history-view  Formatted history table with sparklines (alias: hv)
   install-hook  Configure ~/.claude/settings.json
 
 Flags:
@@ -317,7 +481,7 @@ Flags:
   --modules LIST   Comma-separated modules: bar,pct,sparkline,rate,eta,reset
   --sparkline-type TYPE  braille (default) or block
   --bar-width N    Progress bar width (default: 10, multiline only)
-  --tier T         History tier: short (5-min, 24h) or long (hourly, 1yr)
+  --tier T         History tier: short (5-min, 36h) or long (hourly, 1yr)
 
 Modules:
   bar         Progress bar (multiline only, skipped in single-line)
@@ -359,6 +523,7 @@ case "$subcommand" in
     eta)            cmd_eta "$@" ;;
     fetch)          cmd_fetch "$@" ;;
     history)        cmd_history "$@" ;;
+    history-view|hv) cmd_history_view "$@" ;;
     install-hook)   cmd_install_hook "$@" ;;
     help|--help|-h) cmd_help ;;
     *)

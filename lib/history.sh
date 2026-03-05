@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # history.sh - Dual-tier JSONL history: short (5-min) + long (hourly)
 
-# Short tier: 5-min intervals, 24h retention, five_hour field only
+# Short tier: 5-min intervals, 36h retention, both fields (fine-grained for ETA)
+# Retention covers the largest ETA avg window (CU_ETA_7D_AVG=24h) plus margin
 CU_HISTORY_SHORT="${CU_DATA_DIR}/history-short.jsonl"
 CU_SHORT_INTERVAL=300        # 5 minutes in seconds
-CU_SHORT_MAX_AGE=86400       # 24 hours
+CU_SHORT_MAX_AGE=129600      # 36 hours
 
 # Long tier: hourly intervals, 1-year retention, seven_day field only
 CU_HISTORY_LONG="${CU_DATA_DIR}/history-long.jsonl"
@@ -30,10 +31,11 @@ cu_history_record() {
     local now
     now=$(cu_now)
 
-    # Short tier: 5-min dedup, five_hour field only
-    local has_five_hour
+    # Short tier: 5-min dedup, both fields (fine-grained data for ETA calculations)
+    local has_five_hour has_seven_day_short
     has_five_hour=$(echo "$data" | jq -e '.five_hour' >/dev/null 2>&1 && echo 1 || echo 0)
-    if [ "$has_five_hour" = "1" ]; then
+    has_seven_day_short=$(echo "$data" | jq -e '.seven_day' >/dev/null 2>&1 && echo 1 || echo 0)
+    if [ "$has_five_hour" = "1" ] || [ "$has_seven_day_short" = "1" ]; then
         local short_bucket=$((now / CU_SHORT_INTERVAL))
         local write_short=1
         if [ -f "$CU_HISTORY_SHORT" ]; then
@@ -45,7 +47,9 @@ cu_history_record() {
         if [ "$write_short" = "1" ]; then
             local short_line
             short_line=$(echo "$data" | jq -c --argjson ts "$now" \
-                '{ts: $ts, five_hour: {util: .five_hour.utilization, resets_at: (.five_hour.resets_at // "")}}' \
+                '{ts: $ts}
+                + (if .five_hour then {five_hour: {util: .five_hour.utilization, resets_at: (.five_hour.resets_at // "")}} else {} end)
+                + (if .seven_day then {seven_day: {util: .seven_day.utilization, resets_at: (.seven_day.resets_at // "")}} else {} end)' \
                 2>/dev/null) || true
             [ -n "$short_line" ] && echo "$short_line" >> "$CU_HISTORY_SHORT"
         fi
@@ -152,29 +156,69 @@ cu_history_dump() {
 }
 
 cu_history_migrate() {
+    # Migration 1: old single-file → dual-tier
     local old_file="${CU_DATA_DIR}/history.jsonl"
-    # Only migrate if old file exists and neither new file nor backup exists
-    [ -f "$old_file" ] || return 0
-    [ -f "$CU_HISTORY_SHORT" ] && return 0
-    [ -f "$CU_HISTORY_LONG" ] && return 0
-    [ -f "${old_file}.bak" ] && return 0
+    if [ -f "$old_file" ] && [ ! -f "${old_file}.bak" ] \
+       && [ ! -f "$CU_HISTORY_SHORT" ] && [ ! -f "$CU_HISTORY_LONG" ]; then
 
-    local now
-    now=$(cu_now)
-    local short_cutoff=$((now - CU_SHORT_MAX_AGE))
+        local now
+        now=$(cu_now)
+        local short_cutoff=$((now - CU_SHORT_MAX_AGE))
 
-    # Migrate last 24h → short (five_hour only)
-    jq -c --argjson cutoff "$short_cutoff" \
-        'select(.ts >= $cutoff) | select(.five_hour) | {ts, five_hour}' \
-        "$old_file" > "$CU_HISTORY_SHORT" 2>/dev/null || true
+        # Migrate recent → short (both fields), all → long (seven_day only)
+        jq -c --argjson cutoff "$short_cutoff" \
+            'select(.ts >= $cutoff) | {ts} + (if .five_hour then {five_hour} else {} end) + (if .seven_day then {seven_day} else {} end)' \
+            "$old_file" > "$CU_HISTORY_SHORT" 2>/dev/null || true
 
-    # Migrate all → long (seven_day only)
-    jq -c 'select(.seven_day) | {ts, seven_day}' \
-        "$old_file" > "$CU_HISTORY_LONG" 2>/dev/null || true
+        jq -c 'select(.seven_day) | {ts, seven_day}' \
+            "$old_file" > "$CU_HISTORY_LONG" 2>/dev/null || true
 
-    # Remove empty files
-    [ -s "$CU_HISTORY_SHORT" ] || rm -f "$CU_HISTORY_SHORT"
-    [ -s "$CU_HISTORY_LONG" ] || rm -f "$CU_HISTORY_LONG"
+        [ -s "$CU_HISTORY_SHORT" ] || rm -f "$CU_HISTORY_SHORT"
+        [ -s "$CU_HISTORY_LONG" ] || rm -f "$CU_HISTORY_LONG"
 
-    mv "$old_file" "${old_file}.bak"
+        mv "$old_file" "${old_file}.bak"
+    fi
+
+    # Migration 2: backfill seven_day into short tier by interpolating from long tier
+    _cu_migrate_short_seven_day
+}
+
+_cu_migrate_short_seven_day() {
+    [ -f "$CU_HISTORY_SHORT" ] || return 0
+    [ -f "$CU_HISTORY_LONG" ] || return 0
+
+    # Quick check: if first record already has seven_day, no migration needed
+    if head -1 "$CU_HISTORY_SHORT" | jq -e '.seven_day' >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Read long tier into sorted arrays of (ts, util) for interpolation
+    # Then enrich each short tier record with an interpolated seven_day value
+    local tmp="${CU_HISTORY_SHORT}.mig"
+    jq -c --slurpfile long <(jq -c '{ts, util: .seven_day.util}' "$CU_HISTORY_LONG" 2>/dev/null) '
+        . as $rec |
+        ($long | sort_by(.ts)) as $pts |
+        if ($pts | length) < 1 then $rec
+        else
+            # Find surrounding long-tier points and linearly interpolate
+            ($rec.ts) as $t |
+            ([$pts[] | select(.ts <= $t)] | last // null) as $lo |
+            ([$pts[] | select(.ts > $t)] | first // null) as $hi |
+            if $lo == null and $hi == null then $rec
+            elif $lo == null then $rec + {seven_day: {util: $hi.util, resets_at: ""}}
+            elif $hi == null then $rec + {seven_day: {util: $lo.util, resets_at: ""}}
+            elif $lo.ts == $hi.ts then $rec + {seven_day: {util: $lo.util, resets_at: ""}}
+            else
+                (($t - $lo.ts) / ($hi.ts - $lo.ts)) as $frac |
+                ($lo.util + ($hi.util - $lo.util) * $frac) as $interp |
+                $rec + {seven_day: {util: $interp, resets_at: ""}}
+            end
+        end
+    ' "$CU_HISTORY_SHORT" > "$tmp" 2>/dev/null
+
+    if [ -s "$tmp" ]; then
+        mv "$tmp" "$CU_HISTORY_SHORT"
+    else
+        rm -f "$tmp"
+    fi
 }

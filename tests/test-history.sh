@@ -51,9 +51,9 @@ cu_history_record "$data"
 lines=$(wc -l < "$CU_HISTORY_SHORT")
 assert_eq "next 5-min bucket appends short" "2" "$lines"
 
-# Verify short file only has five_hour, not seven_day
-has_seven=$(jq -r '.seven_day // empty' "$CU_HISTORY_SHORT" | head -1)
-assert_eq "short file has no seven_day" "" "$has_seven"
+# Verify short file has both five_hour and seven_day (fine-grained for ETA)
+has_seven=$(jq -r '.seven_day.util // empty' "$CU_HISTORY_SHORT" | head -1)
+assert_eq "short file has seven_day" "30" "$has_seven"
 val=$(jq -r '.five_hour.util' "$CU_HISTORY_SHORT" | head -1)
 assert_eq "short file has five_hour util" "10" "$val"
 
@@ -141,7 +141,7 @@ export CU_NOW=1709200000
 data_seven_only='{"seven_day":{"utilization":40,"resets_at":"2025-03-06T00:00:00Z"}}'
 cu_history_record "$data_seven_only"
 
-assert_eq "seven_day-only does not create short file" "0" "$([ -f "$CU_HISTORY_SHORT" ] && echo 1 || echo 0)"
+assert_eq "seven_day-only creates short file" "1" "$([ -f "$CU_HISTORY_SHORT" ] && echo 1 || echo 0)"
 assert_eq "seven_day-only creates long file" "1" "$([ -f "$CU_HISTORY_LONG" ] && echo 1 || echo 0)"
 
 val=$(cu_history_values "long" "seven_day" 24 | head -1)
@@ -169,19 +169,19 @@ assert_eq "migration creates long file" "1" "$([ -f "$CU_HISTORY_LONG" ] && echo
 assert_eq "migration creates backup" "1" "$([ -f "${local_old}.bak" ] && echo 1 || echo 0)"
 assert_eq "migration removes original" "0" "$([ -f "$local_old" ] && echo 1 || echo 0)"
 
-# Short should only have entries within 24h of CU_NOW (1709103600)
-# Cutoff = 1709103600 - 86400 = 1709017200
-# ts=1709000000 is before cutoff, ts=1709050000 and ts=1709100000 are after
+# Short should only have entries within 36h of CU_NOW (1709103600)
+# Cutoff = 1709103600 - 129600 = 1708974000
+# All 3 entries (ts=1709000000, 1709050000, 1709100000) are after cutoff
 short_count=$(wc -l < "$CU_HISTORY_SHORT")
-assert_eq "migration short has last-24h entries" "2" "$short_count"
+assert_eq "migration short has last-36h entries" "3" "$short_count"
 
 # Long should have all entries with seven_day
 long_count=$(wc -l < "$CU_HISTORY_LONG")
 assert_eq "migration long has all entries" "3" "$long_count"
 
-# Short entries should only have five_hour field
-has_seven_in_short=$(jq -r '.seven_day // empty' "$CU_HISTORY_SHORT" | head -1)
-assert_eq "migrated short has no seven_day" "" "$has_seven_in_short"
+# Short entries should have both fields (migration preserves both)
+has_seven_in_short=$(jq -e '.seven_day' "$CU_HISTORY_SHORT" >/dev/null 2>&1 && echo "yes" || echo "")
+assert_eq "migrated short has seven_day" "yes" "$has_seven_in_short"
 
 # Long entries should only have seven_day field
 has_five_in_long=$(jq -r '.five_hour // empty' "$CU_HISTORY_LONG" | head -1)
@@ -191,6 +191,81 @@ assert_eq "migrated long has no five_hour" "" "$has_five_in_long"
 cu_history_migrate
 short_count2=$(wc -l < "$CU_HISTORY_SHORT")
 assert_eq "migration is idempotent" "$short_count" "$short_count2"
+
+echo ""
+echo "=== Short Tier seven_day Backfill Migration ==="
+
+# Simulate pre-upgrade short tier (five_hour only) with long tier having seven_day
+rm -f "$CU_HISTORY_SHORT" "$CU_HISTORY_LONG"
+export CU_NOW=1709200000
+# Short tier: 5-min records with only five_hour
+for i in 0 1 2 3; do
+    ts=$((1709200000 - (3 - i) * 300))
+    echo "{\"ts\":$ts,\"five_hour\":{\"util\":$((10 + i)),\"resets_at\":\"\"}}" >> "$CU_HISTORY_SHORT"
+done
+# Long tier: hourly records with seven_day
+echo "{\"ts\":1709196000,\"seven_day\":{\"util\":50,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+echo "{\"ts\":1709200000,\"seven_day\":{\"util\":52,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+
+_CU_MIGRATED=""
+cu_history_migrate
+
+# Verify short tier now has interpolated seven_day
+backfill_check=$(head -1 "$CU_HISTORY_SHORT" | jq -e '.seven_day.util' >/dev/null 2>&1 && echo "yes" || echo "")
+assert_eq "backfill adds seven_day to short tier" "yes" "$backfill_check"
+
+# Running again should be a no-op (first record already has seven_day)
+cp "$CU_HISTORY_SHORT" "${CU_HISTORY_SHORT}.before"
+_CU_MIGRATED=""
+cu_history_migrate
+assert_eq "backfill migration is idempotent" "$(cat "${CU_HISTORY_SHORT}.before")" "$(cat "$CU_HISTORY_SHORT")"
+rm -f "${CU_HISTORY_SHORT}.before"
+
+# Verify interpolated values are reasonable
+first_seven=$(head -1 "$CU_HISTORY_SHORT" | jq -r '.seven_day.util' 2>/dev/null)
+last_seven=$(tail -1 "$CU_HISTORY_SHORT" | jq -r '.seven_day.util' 2>/dev/null)
+assert_eq "backfill first value interpolated between 50-52" "1" \
+    "$(awk "BEGIN { print ($first_seven >= 50 && $first_seven <= 52) ? 1 : 0 }")"
+assert_eq "backfill last value equals long tier endpoint" "52" "$last_seven"
+
+echo ""
+echo "=== Backfill Edge Cases ==="
+
+# Edge: short tier records all before long tier data (extrapolate from nearest)
+rm -f "$CU_HISTORY_SHORT" "$CU_HISTORY_LONG"
+echo '{"ts":1709100000,"five_hour":{"util":5,"resets_at":""}}' >> "$CU_HISTORY_SHORT"
+echo '{"ts":1709200000,"seven_day":{"util":60,"resets_at":""}}' >> "$CU_HISTORY_LONG"
+_CU_MIGRATED=""
+cu_history_migrate
+edge_val=$(head -1 "$CU_HISTORY_SHORT" | jq -r '.seven_day.util' 2>/dev/null)
+assert_eq "backfill before all long data uses nearest" "60" "$edge_val"
+
+# Edge: short tier records all after long tier data
+rm -f "$CU_HISTORY_SHORT" "$CU_HISTORY_LONG"
+echo '{"ts":1709300000,"five_hour":{"util":5,"resets_at":""}}' >> "$CU_HISTORY_SHORT"
+echo '{"ts":1709200000,"seven_day":{"util":40,"resets_at":""}}' >> "$CU_HISTORY_LONG"
+_CU_MIGRATED=""
+cu_history_migrate
+edge_val=$(head -1 "$CU_HISTORY_SHORT" | jq -r '.seven_day.util' 2>/dev/null)
+assert_eq "backfill after all long data uses nearest" "40" "$edge_val"
+
+# Edge: empty long tier — short tier should be unchanged
+rm -f "$CU_HISTORY_SHORT" "$CU_HISTORY_LONG"
+echo '{"ts":1709200000,"five_hour":{"util":5,"resets_at":""}}' >> "$CU_HISTORY_SHORT"
+cp "$CU_HISTORY_SHORT" "${CU_HISTORY_SHORT}.orig"
+_CU_MIGRATED=""
+cu_history_migrate
+assert_eq "backfill with no long tier is no-op" "$(cat "${CU_HISTORY_SHORT}.orig")" "$(cat "$CU_HISTORY_SHORT")"
+rm -f "${CU_HISTORY_SHORT}.orig"
+
+# Edge: short tier already has seven_day — should skip
+rm -f "$CU_HISTORY_SHORT" "$CU_HISTORY_LONG"
+echo '{"ts":1709200000,"five_hour":{"util":5,"resets_at":""},"seven_day":{"util":30,"resets_at":""}}' >> "$CU_HISTORY_SHORT"
+echo '{"ts":1709200000,"seven_day":{"util":99,"resets_at":""}}' >> "$CU_HISTORY_LONG"
+_CU_MIGRATED=""
+cu_history_migrate
+existing_val=$(head -1 "$CU_HISTORY_SHORT" | jq -r '.seven_day.util' 2>/dev/null)
+assert_eq "backfill skips when seven_day already present" "30" "$existing_val"
 
 echo ""
 echo "=== Dump Tests ==="
