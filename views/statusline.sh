@@ -102,6 +102,7 @@ _render_mod_rate() {
 
 _render_mod_eta() {
     # Uses shared _eta_secs, _before_reset from _compute_eta
+    # Uses _win_reset from caller's scope for deadline-relative coloring
     # Args: field (five_hour|seven_day) — determines duration vs date format
     # When no projection available (rate=0, no data): hide entirely — reset module still shows
     local field="${1:-}"
@@ -113,8 +114,26 @@ _render_mod_eta() {
         *)         eta_str=$(cu_fmt_duration "$_eta_secs") ;;
     esac
     [ -z "$eta_str" ] && return 0
-    local color="${CU_COLOR_ETA}"
-    [ "${_before_reset:-}" = "1" ] && color="${CU_COLOR_WARN}"
+
+    # Color based on how close ETA is to the reset deadline:
+    #   hits before reset (ratio <1)  → red
+    #   tight margin (ratio 1-1.5)    → yellow
+    #   comfortable (ratio >1.5)      → green
+    local color="$CU_RED"
+    if [ -n "${_win_reset:-}" ]; then
+        local secs_to_reset
+        secs_to_reset=$(cu_secs_until_reset "$_win_reset")
+        if [ "${secs_to_reset:-0}" -gt 0 ] 2>/dev/null && [ "$_eta_secs" -gt 0 ] 2>/dev/null; then
+            # ratio = eta_secs / secs_to_reset (>1 means won't hit before reset)
+            local pct_ratio
+            pct_ratio=$(awk -v e="$_eta_secs" -v r="$secs_to_reset" 'BEGIN { printf "%d", (e * 100) / r }')
+            if [ "$pct_ratio" -gt 150 ] 2>/dev/null; then
+                color="$CU_GREEN"
+            elif [ "$pct_ratio" -gt 100 ] 2>/dev/null; then
+                color="$CU_YELLOW"
+            fi
+        fi
+    fi
     printf '%s~%s%s' "$(cu_color "$color")" "$eta_str" "$(cu_reset)"
 }
 
