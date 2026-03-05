@@ -195,9 +195,9 @@ cu_eta_projection() {
 }
 
 cu_braille_sparkline() {
-    # Compact sparkline using Braille characters — 2 data points per column.
-    # Left column uses dots 1,2,3 (⠁⠂⠄), right column uses dots 4,5,6 (⠈⠐⠠).
-    # Encodes pairs of values into a single Braille character.
+    # Compact sparkline using 8-dot Braille characters — 2 data points per column.
+    # Left column uses dots 7,3,2,1 (bottom-up), right column uses dots 8,6,5,4.
+    # Encodes pairs of values into a single Braille character (5 levels: 0-4).
     local values=()
     local max_val="${CU_SPARK_MAX:-100}"
 
@@ -211,14 +211,14 @@ cu_braille_sparkline() {
 
     [ ${#values[@]} -eq 0 ] && return
 
-    # Braille dot patterns for 4 levels (0-3) per column
-    # Left column (dots 7,2,1 from bottom): 0=⠀ 1=⠄ 2=⠆ 3=⠇
-    # Right column (dots 8,5,4 from bottom): 0=⠀ 1=⠠ 2=⠰ 3=⠸
-    # Braille base: U+2800, dots are bit flags: d1=0x01 d2=0x02 d3=0x04 d4=0x08 d5=0x10 d6=0x20 d7=0x40 d8=0x80
-    # We use dots 1,2,3 for left (bits 0x01,0x02,0x04) and dots 4,5,6 for right (bits 0x08,0x10,0x20)
-    # Fill from bottom up: d3(0x04) is bottom-left, d6(0x20) is bottom-right
-    local left_bits=(0 4 6 7)     # 0=none, 1=d3, 2=d2+d3, 3=d1+d2+d3
-    local right_bits=(0 32 48 56) # 0=none, 1=d6, 2=d5+d6, 3=d4+d5+d6
+    # Braille 8-dot layout (U+2800 base, bit flags per dot):
+    #   d1=0x01 d4=0x08
+    #   d2=0x02 d5=0x10
+    #   d3=0x04 d6=0x20
+    #   d7=0x40 d8=0x80
+    # Fill bottom-up: left=d7,d3,d2,d1  right=d8,d6,d5,d4
+    local left_bits=(0 64 68 70 71)       # 0-4: none, d7, d7+d3, d7+d3+d2, d7+d3+d2+d1
+    local right_bits=(0 128 160 176 184)  # 0-4: none, d8, d8+d6, d8+d6+d5, d8+d6+d5+d4
 
     # Auto-scale: find actual max (floor stays at 0)
     local data_max=0
@@ -238,8 +238,8 @@ cu_braille_sparkline() {
         lval="${lval%.*}"; lval="${lval:-0}"
         [ "$lval" -lt 0 ] 2>/dev/null && lval=0
         [ "$lval" -gt "$max_val" ] 2>/dev/null && lval="$max_val"
-        local lidx=$(( (lval * 3) / scale_max ))
-        [ "$lidx" -gt 3 ] && lidx=3
+        local lidx=$(( (lval * 4) / scale_max ))
+        [ "$lidx" -gt 4 ] && lidx=4
 
         local rval=0 ridx=0
         if [ $((i + 1)) -lt "$count" ]; then
@@ -247,8 +247,8 @@ cu_braille_sparkline() {
             rval="${rval%.*}"; rval="${rval:-0}"
             [ "$rval" -lt 0 ] 2>/dev/null && rval=0
             [ "$rval" -gt "$max_val" ] 2>/dev/null && rval="$max_val"
-            ridx=$(( (rval * 3) / scale_max ))
-            [ "$ridx" -gt 3 ] && ridx=3
+            ridx=$(( (rval * 4) / scale_max ))
+            [ "$ridx" -gt 4 ] && ridx=4
         fi
 
         local codepoint=$((0x2800 + ${left_bits[$lidx]} + ${right_bits[$ridx]}))
@@ -406,8 +406,8 @@ _cu_braille_with_resets() {
     local scale_max="$data_max"
     [ "$scale_max" -lt 1 ] 2>/dev/null && scale_max=1
 
-    local left_bits=(0 4 6 7)
-    local right_bits=(0 32 48 56)
+    local left_bits=(0 64 68 70 71)
+    local right_bits=(0 128 160 176 184)
 
     local delta_idx=0
     while [ "$delta_idx" -lt "$count" ]; do
@@ -421,16 +421,16 @@ _cu_braille_with_resets() {
             local lval="${deltas[$delta_idx]%.*}"; lval="${lval:-0}"
             [ "$lval" -lt 0 ] 2>/dev/null && lval=0
             [ "$lval" -gt "$max_val" ] 2>/dev/null && lval="$max_val"
-            local lidx=$(( (lval * 3) / scale_max ))
-            [ "$lidx" -gt 3 ] && lidx=3
+            local lidx=$(( (lval * 4) / scale_max ))
+            [ "$lidx" -gt 4 ] && lidx=4
 
             local rval=0 ridx=0
             if [ $((delta_idx + 1)) -lt "$count" ]; then
                 rval="${deltas[$((delta_idx + 1))]%.*}"; rval="${rval:-0}"
                 [ "$rval" -lt 0 ] 2>/dev/null && rval=0
                 [ "$rval" -gt "$max_val" ] 2>/dev/null && rval="$max_val"
-                ridx=$(( (rval * 3) / scale_max ))
-                [ "$ridx" -gt 3 ] && ridx=3
+                ridx=$(( (rval * 4) / scale_max ))
+                [ "$ridx" -gt 4 ] && ridx=4
             fi
 
             local codepoint=$((0x2800 + ${left_bits[$lidx]} + ${right_bits[$ridx]}))

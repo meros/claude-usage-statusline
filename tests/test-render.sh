@@ -59,9 +59,9 @@ echo "=== Braille Sparkline Tests ==="
 result=$(cu_braille_sparkline 0 0)
 assert_eq "braille zeros" "⠀" "$result"
 
-# 100,100 -> full braille (bits d1+d2+d3+d4+d5+d6 = 0x3F)
+# 100,100 -> full 8-dot braille (all dots = 0xFF)
 result=$(cu_braille_sparkline 100 100)
-assert_eq "braille full" "⠿" "$result"
+assert_eq "braille full" "⣿" "$result"
 
 # 4 values = 2 braille chars
 result=$(cu_braille_sparkline 0 0 100 100)
