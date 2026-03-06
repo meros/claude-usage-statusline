@@ -142,6 +142,8 @@ cu_fetch() {
         local tmp="${CU_CACHE_FILE}.tmp.$$"
         echo "$resp" > "$tmp"
         mv "$tmp" "$CU_CACHE_FILE"
+        # Clear backoff on success — reset exponential progression
+        rm -f "$CU_BACKOFF_FILE"
         return 0
     fi
 
@@ -155,17 +157,14 @@ cu_fetch() {
         # On rate limit, write a backoff marker to prevent hammering the API.
         # The cache file's mtime is NOT touched — it reflects when data was last updated.
         if [ "$err_type" = "rate_limit_error" ]; then
-            # Read Retry-After header value from response headers if available
+            # Exponential backoff: read previous duration and double it (cap 30 min)
             local retry_secs="${CU_CACHE_MAX_AGE}"
-            # Exponential backoff: double the backoff on consecutive rate limits
             if [ -f "$CU_BACKOFF_FILE" ]; then
-                local prev_age
-                prev_age=$(( $(cu_now) - $(stat -c %Y "$CU_BACKOFF_FILE" 2>/dev/null || echo 0) ))
-                # If we're hitting rate limits within the backoff window, double it (up to 30 min)
-                if [ "$prev_age" -lt "$((CU_CACHE_MAX_AGE * 2))" ]; then
-                    retry_secs=$((CU_CACHE_MAX_AGE * 2))
-                    [ "$retry_secs" -gt 1800 ] && retry_secs=1800
-                fi
+                local prev_dur
+                prev_dur=$(cat "$CU_BACKOFF_FILE" 2>/dev/null)
+                prev_dur="${prev_dur:-$CU_CACHE_MAX_AGE}"
+                retry_secs=$((prev_dur * 2))
+                [ "$retry_secs" -gt 1800 ] && retry_secs=1800
             fi
             cu_log "fetch: rate limited, backing off ${retry_secs}s"
             # Write backoff duration so cu_is_backing_off can use it
