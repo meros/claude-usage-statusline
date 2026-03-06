@@ -2,12 +2,13 @@
 # dashboard.sh - Multi-line standalone terminal dashboard
 
 cu_view_dashboard() {
-    # Fetch + record history (don't abort on fetch failure under set -e)
+    # Fetch + record history (only record when we got fresh data)
     if [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
-        cu_fetch || true
-        local cache_data
-        cache_data=$(cu_read_cache)
-        [ -n "$cache_data" ] && cu_history_record "$cache_data"
+        if cu_fetch; then
+            local cache_data
+            cache_data=$(cu_read_cache)
+            [ -n "$cache_data" ] && cu_history_record "$cache_data"
+        fi
     fi
 
     local data

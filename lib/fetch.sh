@@ -3,6 +3,7 @@
 
 CU_CACHE_FILE="${CU_CACHE_DIR}/api-response.json"
 CU_CACHE_MAX_AGE="${CU_CACHE_MAX_AGE:-300}"
+CU_BACKOFF_FILE="${CU_CACHE_DIR}/rate-limit-backoff"
 
 cu_cache_is_fresh() {
     [ -f "$CU_CACHE_FILE" ] || return 1
@@ -11,6 +12,28 @@ cu_cache_is_fresh() {
     file_mtime=$(stat -c %Y "$CU_CACHE_FILE" 2>/dev/null || stat -f %m "$CU_CACHE_FILE" 2>/dev/null || echo 0)
     cache_age=$((now - file_mtime))
     [ "$cache_age" -lt "$CU_CACHE_MAX_AGE" ]
+}
+
+# Check if we're in a rate-limit backoff period (separate from cache freshness)
+cu_is_backing_off() {
+    [ -f "$CU_BACKOFF_FILE" ] || return 1
+    local now backoff_mtime backoff_age backoff_dur
+    now=$(cu_now)
+    backoff_mtime=$(stat -c %Y "$CU_BACKOFF_FILE" 2>/dev/null || stat -f %m "$CU_BACKOFF_FILE" 2>/dev/null || echo 0)
+    backoff_age=$((now - backoff_mtime))
+    # Read stored backoff duration, default to CU_CACHE_MAX_AGE
+    backoff_dur=$(cat "$CU_BACKOFF_FILE" 2>/dev/null)
+    backoff_dur="${backoff_dur:-$CU_CACHE_MAX_AGE}"
+    [ "$backoff_age" -lt "$backoff_dur" ]
+}
+
+# Seconds since cache data was last actually updated by a successful API call
+cu_cache_age() {
+    [ -f "$CU_CACHE_FILE" ] || { echo 0; return; }
+    local now file_mtime
+    now=$(cu_now)
+    file_mtime=$(stat -c %Y "$CU_CACHE_FILE" 2>/dev/null || stat -f %m "$CU_CACHE_FILE" 2>/dev/null || echo 0)
+    echo $((now - file_mtime))
 }
 
 cu_resolve_token() {
@@ -52,6 +75,11 @@ cu_fetch() {
     if [ "$force" != "force" ] && cu_cache_is_fresh; then
         cu_log "fetch: cache is fresh, skipping"
         return 0
+    fi
+    # Skip fetch during rate-limit backoff (but cache may be stale)
+    if [ "$force" != "force" ] && cu_is_backing_off; then
+        cu_log "fetch: in rate-limit backoff, skipping"
+        return 1
     fi
 
     # Acquire lock so multiple instances don't race for the API
@@ -124,14 +152,26 @@ cu_fetch() {
     if [ -n "$api_err" ]; then
         cu_log "fetch: API error: $api_err"
         echo "API error: $api_err" >&2
-        # On rate limit, touch existing cache to prevent hammering the API.
-        # If no cache exists, write a minimal sentinel.
+        # On rate limit, write a backoff marker to prevent hammering the API.
+        # The cache file's mtime is NOT touched — it reflects when data was last updated.
         if [ "$err_type" = "rate_limit_error" ]; then
-            if [ -f "$CU_CACHE_FILE" ]; then
-                cu_log "fetch: rate limited, refreshing cache mtime"
-                touch "$CU_CACHE_FILE"
-            else
-                cu_log "fetch: rate limited, writing backoff sentinel"
+            # Read Retry-After header value from response headers if available
+            local retry_secs="${CU_CACHE_MAX_AGE}"
+            # Exponential backoff: double the backoff on consecutive rate limits
+            if [ -f "$CU_BACKOFF_FILE" ]; then
+                local prev_age
+                prev_age=$(( $(cu_now) - $(stat -c %Y "$CU_BACKOFF_FILE" 2>/dev/null || echo 0) ))
+                # If we're hitting rate limits within the backoff window, double it (up to 30 min)
+                if [ "$prev_age" -lt "$((CU_CACHE_MAX_AGE * 2))" ]; then
+                    retry_secs=$((CU_CACHE_MAX_AGE * 2))
+                    [ "$retry_secs" -gt 1800 ] && retry_secs=1800
+                fi
+            fi
+            cu_log "fetch: rate limited, backing off ${retry_secs}s"
+            # Write backoff duration so cu_is_backing_off can use it
+            echo "$retry_secs" > "$CU_BACKOFF_FILE"
+            if [ ! -f "$CU_CACHE_FILE" ]; then
+                cu_log "fetch: no cache exists, writing sentinel"
                 local retry_at=$(($(cu_now) + CU_CACHE_MAX_AGE))
                 local tmp="${CU_CACHE_FILE}.tmp.$$"
                 printf '{"_error":"rate_limited","_retry_at":%d}\n' "$retry_at" > "$tmp"

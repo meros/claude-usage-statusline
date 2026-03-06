@@ -169,10 +169,11 @@ cmd_sparkline() {
     local mode=""
     [ "${CU_OPT_BRAILLE:-}" = "1" ] && mode="braille"
     if [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
-        cu_fetch || true
-        local cache_data
-        cache_data=$(cu_read_cache)
-        [ -n "$cache_data" ] && cu_history_record "$cache_data"
+        if cu_fetch; then
+            local cache_data
+            cache_data=$(cu_read_cache)
+            [ -n "$cache_data" ] && cu_history_record "$cache_data"
+        fi
     fi
     cu_sparkline_from_history "$field" "$hours" "$width" "$mode" "$tier"
     echo
@@ -181,10 +182,11 @@ cmd_sparkline() {
 cmd_eta() {
     parse_flags "$@"
     if [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
-        cu_fetch || true
-        local cache_data
-        cache_data=$(cu_read_cache)
-        [ -n "$cache_data" ] && cu_history_record "$cache_data"
+        if cu_fetch; then
+            local cache_data
+            cache_data=$(cu_read_cache)
+            [ -n "$cache_data" ] && cu_history_record "$cache_data"
+        fi
     fi
     local any_output=""
     local _eta_win

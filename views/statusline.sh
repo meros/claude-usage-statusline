@@ -20,16 +20,29 @@ cu_view_statusline() {
     git_branch=$(cd "$cwd" 2>/dev/null && git branch --show-current 2>/dev/null || true)
     cu_log "statusline: cwd=$cwd branch=$git_branch"
 
-    # Fetch + record history (don't abort on fetch failure under set -e)
+    # Fetch + record history (only record when we got fresh data)
+    local _fetch_ok=""
     if [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
-        cu_fetch || cu_log "statusline: fetch failed, using cached data"
-        local cache_data
-        cache_data=$(cu_read_cache)
-        [ -n "$cache_data" ] && cu_history_record "$cache_data"
+        if cu_fetch; then
+            _fetch_ok=1
+            local cache_data
+            cache_data=$(cu_read_cache)
+            [ -n "$cache_data" ] && cu_history_record "$cache_data"
+        else
+            cu_log "statusline: fetch failed, using cached data"
+        fi
     fi
 
     local data
     data=$(cu_read_cache)
+
+    # Check staleness: data age > 2x cache TTL means we've failed to refresh
+    local _cache_stale=""
+    if [ -z "$_fetch_ok" ] && [ -f "$CU_CACHE_FILE" ]; then
+        local age
+        age=$(cu_cache_age)
+        [ "$age" -gt $((CU_CACHE_MAX_AGE * 2)) ] && _cache_stale=1
+    fi
 
     # Parse usage data once
     local five_pct="" seven_pct="" five_reset="" seven_reset="" cache_error=""
@@ -267,6 +280,9 @@ _statusline_single() {
 
     printf "%s%s" "$dir_section" "$usage_section"
 
+    # Staleness warning
+    [ "$_cache_stale" = "1" ] && printf " %s(stale)%s" "$(cu_color "$CU_DIM")" "$(cu_reset)"
+
     # Update notification (appended at end of line)
     local update_msg
     update_msg=$(cu_update_message)
@@ -393,6 +409,15 @@ _statusline_multiline() {
             [ "$pad" -gt 0 ] && printf "%*s" "$pad" ""
         done
     done
+
+    # Staleness warning
+    if [ "$_cache_stale" = "1" ]; then
+        local age
+        age=$(cu_cache_age)
+        local stale_str
+        stale_str=$(cu_fmt_duration "$age")
+        printf " %s(stale %s)%s" "$(cu_color "$CU_DIM")" "$stale_str" "$(cu_reset)"
+    fi
 
     # Update notification on its own line
     local update_msg
