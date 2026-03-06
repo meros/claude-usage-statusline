@@ -116,9 +116,9 @@ _render_mod_eta() {
     [ -z "$eta_str" ] && return 0
 
     # Color based on how close ETA is to the reset deadline:
-    #   hits before reset (ratio <1)  → red
-    #   tight margin (ratio 1-1.5)    → yellow
-    #   comfortable (ratio >1.5)      → green
+    #   hits before reset (ratio <1)    → red
+    #   tight margin (ratio 1-1.2)      → yellow
+    #   comfortable (ratio >1.2)        → green
     local color="$CU_RED"
     if [ -n "${_win_reset:-}" ]; then
         local secs_to_reset
@@ -127,7 +127,7 @@ _render_mod_eta() {
             # ratio = eta_secs / secs_to_reset (>1 means won't hit before reset)
             local pct_ratio
             pct_ratio=$(awk -v e="$_eta_secs" -v r="$secs_to_reset" 'BEGIN { printf "%d", (e * 100) / r }')
-            if [ "$pct_ratio" -gt 150 ] 2>/dev/null; then
+            if [ "$pct_ratio" -gt 120 ] 2>/dev/null; then
                 color="$CU_GREEN"
             elif [ "$pct_ratio" -gt 100 ] 2>/dev/null; then
                 color="$CU_YELLOW"

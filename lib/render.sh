@@ -129,7 +129,10 @@ cu_eta_projection() {
             select(.[$f] != null and .[$f].util != null) |
             [.ts, .[$f].util, (.[$f].resets_at // "")] | @tsv' 2>/dev/null)
 
-    # Compute rate with awk (same algorithm, fed from single jq call)
+    # Compute rate with awk:
+    #   - Interpolates at window boundary for accurate partial-segment handling
+    #   - Sums only positive inter-sample deltas (skips reset drops > 30pt)
+    #   - Divides by exact wall-clock window duration (includes idle/gaps)
     local result
     result=$(printf '%s\n' "$tsv_data" | awk -F'\t' -v window="$avg_window" '
         BEGIN { n = 0 }
@@ -140,27 +143,46 @@ cu_eta_projection() {
         }
         END {
             if (n < 2) exit 1
+            if (ts[n-1] <= ts[0]) exit 1
 
-            # Wall-clock rate: total change over total time for the window
-            total_hours = (ts[n-1] - ts[0]) / 3600
-            if (total_hours <= 0) exit 1
+            win_secs = window * 3600
+            t_end = ts[n-1]
+            t_start = t_end - win_secs
 
-            # Use only the last "window" hours of data
-            win_start = 0
-            if (total_hours > window) {
-                cutoff = ts[n-1] - window * 3600
-                for (i = 0; i < n; i++) {
-                    if (ts[i] >= cutoff) { win_start = i; break }
+            # Clamp to available data if window exceeds history
+            if (t_start < ts[0]) t_start = ts[0]
+            win_hours = (t_end - t_start) / 3600
+            if (win_hours <= 0) exit 1
+
+            # Find the segment containing t_start: ts[seg-1] <= t_start < ts[seg]
+            seg = 0
+            for (i = 1; i < n; i++) {
+                if (ts[i] > t_start) { seg = i; break }
+            }
+            if (seg == 0) seg = 1  # all data is after t_start
+
+            # Interpolate value at t_start within the boundary segment
+            # Skip interpolation across resets (drop > 30 points)
+            pos_change = 0
+            if (ts[seg-1] <= t_start && ts[seg] > t_start) {
+                delta = val[seg] - val[seg-1]
+                if (delta > 0) {
+                    # Proportional contribution of the partial segment
+                    frac = (ts[seg] - t_start) / (ts[seg] - ts[seg-1])
+                    pos_change += delta * frac
                 }
+                # Reset or flat segment: no contribution, start fresh at seg
             }
 
-            win_hours = (ts[n-1] - ts[win_start]) / 3600
-            if (win_hours <= 0) exit 1
-            win_change = val[n-1] - val[win_start]
-            if (win_change <= 0) exit 1
-            rate = win_change / win_hours
+            # Sum positive deltas for all complete segments within the window
+            for (i = seg + 1; i < n; i++) {
+                delta = val[i] - val[i-1]
+                if (delta > 0) pos_change += delta
+            }
+            if (pos_change <= 0) exit 1
 
-            if (rate <= 0) exit 1
+            rate = pos_change / win_hours
+
             remaining = 100 - val[n-1]
             if (remaining <= 0) exit 1
             hours_to_cap = remaining / rate
