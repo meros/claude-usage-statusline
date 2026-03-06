@@ -69,6 +69,24 @@ cu_view_statusline() {
     fi
 }
 
+# Build staleness detail string: "(stale 1h 9m, backoff 10m)"
+_stale_detail() {
+    local age
+    age=$(cu_cache_age)
+    local parts="stale $(cu_fmt_duration "$age")"
+    if [ -f "$CU_BACKOFF_FILE" ]; then
+        local backoff_dur backoff_mtime backoff_remaining
+        backoff_dur=$(cat "$CU_BACKOFF_FILE" 2>/dev/null)
+        backoff_dur="${backoff_dur:-$CU_CACHE_MAX_AGE}"
+        backoff_mtime=$(stat -c %Y "$CU_BACKOFF_FILE" 2>/dev/null || stat -f %m "$CU_BACKOFF_FILE" 2>/dev/null || echo 0)
+        backoff_remaining=$(( backoff_dur - ($(cu_now) - backoff_mtime) ))
+        if [ "$backoff_remaining" -gt 0 ] 2>/dev/null; then
+            parts+=", retry $(cu_fmt_duration "$backoff_remaining")"
+        fi
+    fi
+    printf '%s(%s)%s' "$(cu_color "$CU_DIM")" "$parts" "$(cu_reset)"
+}
+
 # --- Module rendering functions ---
 # Each takes: window_field, pct, reset_time, and uses shared _eta_info_* vars
 
@@ -281,7 +299,7 @@ _statusline_single() {
     printf "%s%s" "$dir_section" "$usage_section"
 
     # Staleness warning
-    [ "$_cache_stale" = "1" ] && printf " %s(stale)%s" "$(cu_color "$CU_DIM")" "$(cu_reset)"
+    [ "$_cache_stale" = "1" ] && printf " %s" "$(_stale_detail)"
 
     # Update notification (appended at end of line)
     local update_msg
@@ -411,13 +429,7 @@ _statusline_multiline() {
     done
 
     # Staleness warning
-    if [ "$_cache_stale" = "1" ]; then
-        local age
-        age=$(cu_cache_age)
-        local stale_str
-        stale_str=$(cu_fmt_duration "$age")
-        printf " %s(stale %s)%s" "$(cu_color "$CU_DIM")" "$stale_str" "$(cu_reset)"
-    fi
+    [ "$_cache_stale" = "1" ] && printf " %s" "$(_stale_detail)"
 
     # Update notification on its own line
     local update_msg
