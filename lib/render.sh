@@ -109,8 +109,8 @@ cu_fmt_rate_per_window() {
 }
 
 cu_eta_projection() {
-    # Calculate ETA to 100% using moving average of positive hourly deltas
-    # Args: field (five_hour|seven_day), avg_window (number of recent positive deltas to average), tier (short|long)
+    # Calculate ETA to 100% using net change over a wall-clock window
+    # Args: field (five_hour|seven_day), avg_window (hours), tier (short|long)
     local field="${1:-seven_day}" avg_window="${2:-24}" tier="${3:-}"
 
     # Prefer short tier (fine-grained 5-min data) for accurate rate calculation
@@ -129,10 +129,22 @@ cu_eta_projection() {
             select(.[$f] != null and .[$f].util != null) |
             [.ts, .[$f].util, (.[$f].resets_at // "")] | @tsv' 2>/dev/null)
 
-    # Compute rate with awk:
-    #   - Interpolates at window boundary for accurate partial-segment handling
-    #   - Sums only positive inter-sample deltas (skips reset drops > 30pt)
-    #   - Divides by exact wall-clock window duration (includes idle/gaps)
+    # Compute rate via net change over the averaging window.
+    #
+    # Key design decisions:
+    #   - Net change (end − start) instead of sum-of-positive-deltas, so API
+    #     value jitter doesn't inflate the rate.
+    #   - Reset detection: if a drop > 30 points occurs in the data, only
+    #     post-reset usage counts (pre-reset consumption is irrelevant to
+    #     current time-to-cap).
+    #   - Gaps (laptop sleep, weekends): we find the last known value AT OR
+    #     BEFORE the window boundary — no interpolation across gaps, because
+    #     utilization doesn't change while the machine is off.
+    #   - The denominator is always wall-clock hours (window size or time
+    #     since reset), so %/1d means "consumption per calendar day" including
+    #     idle time.
+    #   - Minimum data requirement: need at least 2 distinct values within the
+    #     effective window (otherwise can't compute a rate).
     local result
     result=$(printf '%s\n' "$tsv_data" | awk -F'\t' -v window="$avg_window" '
         BEGIN { n = 0 }
@@ -143,59 +155,61 @@ cu_eta_projection() {
         }
         END {
             if (n < 2) exit 1
-            if (ts[n-1] <= ts[0]) exit 1
 
-            win_secs = window * 3600
             t_end = ts[n-1]
-            t_start = t_end - win_secs
+            t_start = t_end - window * 3600
 
-            # Clamp to available data if window exceeds history
-            if (t_start < ts[0]) t_start = ts[0]
-            win_hours = (t_end - t_start) / 3600
-            if (win_hours <= 0) exit 1
-
-            # Find the segment containing t_start: ts[seg-1] <= t_start < ts[seg]
-            seg = 0
+            # --- Reset detection (scan ALL loaded data) ---
+            # Find the last reset (drop > 30 points). If a reset occurred,
+            # only post-reset data matters for predicting time-to-cap.
+            last_reset = -1
             for (i = 1; i < n; i++) {
-                if (ts[i] > t_start) { seg = i; break }
+                if ((val[i] - val[i-1]) < -30) last_reset = i
             }
-            if (seg == 0) seg = 1  # all data is after t_start
 
-            # Scan for the last reset (drop > 30 points) to find effective window start
-            # After a reset, only post-reset usage matters for ETA
-            last_reset_idx = -1
-            for (i = seg; i < n; i++) {
-                if (i > 0 && (val[i] - val[i-1]) < -30) {
-                    last_reset_idx = i
+            # --- Determine start value and effective window ---
+            # Two cases:
+            #   1. Reset WITHIN the window: measure from reset point, denominator
+            #      is time-since-reset (can be short — that is all we have).
+            #   2. Reset BEFORE the window (or no reset): use the last known
+            #      value at or before the window boundary. Denominator is the
+            #      full window. No interpolation across gaps (value is flat
+            #      when not polling).
+            has_recent_reset = 0
+            if (last_reset >= 0 && ts[last_reset] >= t_start) {
+                # Reset inside the window
+                start_val = val[last_reset]
+                effective_start = ts[last_reset]
+                has_recent_reset = 1
+            } else {
+                # No reset, or reset was before the window.
+                # Find last data point at or before t_start (post-reset if applicable).
+                first_valid = (last_reset >= 0) ? last_reset : 0
+                if (t_start <= ts[first_valid]) {
+                    start_val = val[first_valid]
+                    effective_start = ts[first_valid]
+                } else {
+                    boundary = first_valid
+                    for (i = first_valid; i < n; i++) {
+                        if (ts[i] <= t_start) boundary = i
+                        else break
+                    }
+                    start_val = val[boundary]
+                    effective_start = t_start  # wall-clock window start
                 }
             }
 
-            # Determine effective window start value and timestamp
-            if (last_reset_idx >= 0) {
-                # Reset found — measure net change from reset point
-                start_val = val[last_reset_idx]
-                effective_start = ts[last_reset_idx]
-            } else if (ts[seg-1] <= t_start && ts[seg] > t_start && seg > 0) {
-                # Interpolate value at t_start within the boundary segment
-                frac = (t_start - ts[seg-1]) / (ts[seg] - ts[seg-1])
-                start_val = val[seg-1] + (val[seg] - val[seg-1]) * frac
-                effective_start = t_start
-            } else {
-                # Window starts at or before first data point
-                start_val = val[seg > 0 ? seg - 1 : 0]
-                effective_start = ts[seg > 0 ? seg - 1 : 0]
-            }
-
-            # Net change over the effective window (immune to micro-fluctuations)
             net_change = val[n-1] - start_val
             if (net_change <= 0) exit 1
 
             win_hours = (t_end - effective_start) / 3600
             if (win_hours <= 0) exit 1
 
-            # Require at least 25% of the requested window to be covered by data
-            # Prevents tiny data spans (e.g. 1h after a gap) from wildly inflating rates
-            if (win_hours < window * 0.25) exit 1
+            # Minimum data span: need at least 25% of requested window
+            # covered, otherwise the projection is unreliable.
+            # Exception: reset within the window — the post-reset span IS all
+            # the relevant data, we cannot look further back.
+            if (!has_recent_reset && win_hours < window * 0.25) exit 1
 
             rate = net_change / win_hours
 

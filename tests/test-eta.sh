@@ -168,9 +168,14 @@ if [ -n "$eta_info" ]; then
     assert_eq "post-reset rate = 5.0" "5.0" "$rate"
 fi
 
-# Window=10h with only 2h post-reset data (20% coverage) — too sparse, no output
-eta_info=$(cu_eta_projection "seven_day" 10 "long" 2>/dev/null || true)
-assert_eq "sparse post-reset data rejected" "" "$eta_info"
+# Window=10h with only 2h post-reset data — coverage check skipped after reset
+eta_info=$(cu_eta_projection "seven_day" 10 "long" 2>/dev/null)
+assert_nonzero "post-reset data accepted despite short span" "$eta_info"
+
+if [ -n "$eta_info" ]; then
+    read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+    assert_eq "post-reset rate with large window = 5.0" "5.0" "$rate"
+fi
 
 echo ""
 echo "=== Noisy Data: Net Change Immune to Micro-Fluctuations ==="
@@ -246,6 +251,118 @@ export CU_NOW=$((local_base + 2 * 3600))
 
 eta_info=$(cu_eta_projection "seven_day" 24 "long" 2>/dev/null || true)
 assert_eq "no eta with only negative deltas" "" "$eta_info"
+
+echo ""
+echo "=== Gap Handling: Weekend Gap (Real-World Scenario) ==="
+
+# Simulate: active Fri (12%), offline Sat-Sun, back Mon (still 12% → 16%)
+# Window=24h should use last known value before gap (12%), not interpolate
+> "$CU_HISTORY_LONG"
+local_base=1700000000
+# Friday active: hourly readings 8%→12% over 4 hours
+for i in 0 1 2 3 4; do
+    ts=$((local_base + i * 3600))
+    val=$((8 + i))
+    echo "{\"ts\":$ts,\"seven_day\":{\"util\":$val,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+done
+# 46-hour gap (weekend)
+# Monday: back online, usage climbed to 15% then 16% over 2 hours
+for i in 0 1 2 3; do
+    ts=$((local_base + 4 * 3600 + 46 * 3600 + i * 1800))  # 30-min intervals
+    val=$((14 + (i > 0 ? 1 : 0) + (i > 2 ? 1 : 0)))
+    echo "{\"ts\":$ts,\"seven_day\":{\"util\":$val,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+done
+export CU_NOW=$((local_base + 4 * 3600 + 46 * 3600 + 3 * 1800))
+
+eta_info=$(cu_eta_projection "seven_day" 24 "long" 2>/dev/null)
+assert_nonzero "weekend gap produces output" "$eta_info"
+
+if [ -n "$eta_info" ]; then
+    read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+    # Last value before 24h-ago boundary is 12% (Fri hour 4).
+    # Current value is 16%. Net = 4% over 24h = 0.17%/h
+    assert_range "weekend gap: rate uses last-known value before gap" "0.1" "0.2" "$rate"
+fi
+
+echo ""
+echo "=== Gap Handling: Reset Hidden in Gap ==="
+
+# Data before gap: 80%. Gap spans a reset. After gap: 5% → 8%
+> "$CU_HISTORY_LONG"
+local_base=1700000000
+# Before gap: 70%→80% over 2 hours
+for i in 0 1 2; do
+    ts=$((local_base + i * 3600))
+    val=$((70 + i * 5))
+    echo "{\"ts\":$ts,\"seven_day\":{\"util\":$val,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+done
+# Reset happened during 30h gap (invisible in data)
+# After gap: 5%→8% over 3 hours
+for i in 0 1 2 3; do
+    ts=$((local_base + 2 * 3600 + 30 * 3600 + i * 3600))
+    val=$((5 + i))
+    echo "{\"ts\":$ts,\"seven_day\":{\"util\":$val,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+done
+export CU_NOW=$((local_base + 2 * 3600 + 30 * 3600 + 3 * 3600))
+
+eta_info=$(cu_eta_projection "seven_day" 24 "long" 2>/dev/null)
+assert_nonzero "reset-in-gap produces output" "$eta_info"
+
+if [ -n "$eta_info" ]; then
+    read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+    # 80% → 8% is a drop of 72 points — detected as reset.
+    # Post-reset: 5%→8% over 3h = 1.0%/h
+    assert_eq "reset-in-gap: rate based on post-reset data" "1.0" "$rate"
+fi
+
+echo ""
+echo "=== Gap Handling: All Data After Window Start ==="
+
+# Only have 2 hours of data, window is 24h
+# Should clamp but require minimum coverage
+> "$CU_HISTORY_LONG"
+local_base=1700000000
+for i in 0 1 2 3 4; do
+    ts=$((local_base + i * 1800))  # 30-min intervals, 2h total
+    val=$((20 + i * 2))
+    echo "{\"ts\":$ts,\"seven_day\":{\"util\":$val,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+done
+export CU_NOW=$((local_base + 4 * 1800))
+
+# 2h of data for a 24h window = 8.3% coverage — below 25% minimum
+eta_info=$(cu_eta_projection "seven_day" 24 "long" 2>/dev/null || true)
+assert_eq "tiny data span for large window rejected" "" "$eta_info"
+
+# Same data but with window=4h: 2h/4h = 50% coverage — should work
+eta_info=$(cu_eta_projection "seven_day" 4 "long" 2>/dev/null)
+assert_nonzero "adequate coverage produces output" "$eta_info"
+
+if [ -n "$eta_info" ]; then
+    read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+    # 20→28 over 2h = 4.0%/h
+    assert_eq "small window rate correct" "4.0" "$rate"
+fi
+
+echo ""
+echo "=== Gap Handling: Multiple Gaps Within Window ==="
+
+# Data: 10% at t=0, gap, 14% at t=10h, gap, 18% at t=20h, 20% at t=24h
+> "$CU_HISTORY_LONG"
+local_base=1700000000
+echo "{\"ts\":$local_base,\"seven_day\":{\"util\":10,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+echo "{\"ts\":$((local_base + 10 * 3600)),\"seven_day\":{\"util\":14,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+echo "{\"ts\":$((local_base + 20 * 3600)),\"seven_day\":{\"util\":18,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+echo "{\"ts\":$((local_base + 24 * 3600)),\"seven_day\":{\"util\":20,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+export CU_NOW=$((local_base + 24 * 3600))
+
+eta_info=$(cu_eta_projection "seven_day" 24 "long" 2>/dev/null)
+assert_nonzero "multiple gaps produces output" "$eta_info"
+
+if [ -n "$eta_info" ]; then
+    read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+    # 10→20 over 24h = ~0.4%/h
+    assert_range "multiple gaps: correct net rate" "0.3" "0.5" "$rate"
+fi
 
 echo ""
 echo "=== Default Tier Based on Field ==="
