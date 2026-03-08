@@ -167,51 +167,58 @@ cu_eta_projection() {
                 if ((val[i] - val[i-1]) < -30) last_reset = i
             }
 
-            # --- Determine start value and effective window ---
-            # Two cases:
-            #   1. Reset WITHIN the window: measure from reset point, denominator
-            #      is time-since-reset (can be short — that is all we have).
-            #   2. Reset BEFORE the window (or no reset): use the last known
-            #      value at or before the window boundary. Denominator is the
-            #      full window. No interpolation across gaps (value is flat
-            #      when not polling).
-            has_recent_reset = 0
-            if (last_reset >= 0 && ts[last_reset] >= t_start) {
-                # Reset inside the window
-                start_val = val[last_reset]
-                effective_start = ts[last_reset]
-                has_recent_reset = 1
+            # --- Find the boundary value at the window start ---
+            # Use the last known data point AT OR BEFORE t_start
+            # (no interpolation across gaps — value is flat while offline).
+            if (t_start <= ts[0]) {
+                start_val = val[0]
+                effective_start = ts[0]
             } else {
-                # No reset, or reset was before the window.
-                # Find last data point at or before t_start (post-reset if applicable).
-                first_valid = (last_reset >= 0) ? last_reset : 0
-                if (t_start <= ts[first_valid]) {
-                    start_val = val[first_valid]
-                    effective_start = ts[first_valid]
-                } else {
-                    boundary = first_valid
-                    for (i = first_valid; i < n; i++) {
-                        if (ts[i] <= t_start) boundary = i
-                        else break
-                    }
-                    start_val = val[boundary]
-                    effective_start = t_start  # wall-clock window start
+                boundary = 0
+                for (i = 0; i < n; i++) {
+                    if (ts[i] <= t_start) boundary = i
+                    else break
                 }
+                start_val = val[boundary]
+                effective_start = t_start  # wall-clock window start
             }
 
-            net_change = val[n-1] - start_val
-            if (net_change <= 0) exit 1
+            # --- Compute total consumption within the window ---
+            # If a reset occurred, we need BOTH sides:
+            #   pre-reset consumption + post-reset consumption.
+            # Without a reset, it is simply net change end−start.
+            #
+            # Example: window has 80%→100% (pre-reset +20%), reset to 0%,
+            # then 0%→16% (post-reset +16%) → total consumption = 36%.
+            total_consumption = 0
+            if (last_reset >= 0 && ts[last_reset] >= effective_start) {
+                # Reset(s) inside the window — sum consumption on each side
+                # Pre-reset: from start_val to the value just before reset
+                pre_reset_val = val[last_reset - 1]
+                pre = pre_reset_val - start_val
+                if (pre > 0) total_consumption += pre
+
+                # Post-reset: from reset value to current
+                post = val[n-1] - val[last_reset]
+                if (post > 0) total_consumption += post
+
+                has_recent_reset = 1
+            } else {
+                total_consumption = val[n-1] - start_val
+                has_recent_reset = 0
+            }
+            if (total_consumption <= 0) exit 1
 
             win_hours = (t_end - effective_start) / 3600
             if (win_hours <= 0) exit 1
 
             # Minimum data span: need at least 25% of requested window
             # covered, otherwise the projection is unreliable.
-            # Exception: reset within the window — the post-reset span IS all
-            # the relevant data, we cannot look further back.
+            # Exception: reset within the window — post-reset span may be
+            # short but we already have the full consumption picture.
             if (!has_recent_reset && win_hours < window * 0.25) exit 1
 
-            rate = net_change / win_hours
+            rate = total_consumption / win_hours
 
             remaining = 100 - val[n-1]
             if (remaining <= 0) exit 1

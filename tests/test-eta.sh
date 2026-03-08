@@ -149,32 +149,33 @@ for i in 0 1 2 3 4; do
 done
 export CU_NOW=$((local_base + 4 * 3600))
 
-# Window=3h: 50→15 is a reset; post-reset 15→20→25 = +10 over 2h = 5.0%/h
+# Window=3h: boundary at hour 1 (val=50). Reset 50→15. Pre-reset: 50-50=0.
+# Post-reset: 25-15=10. Total=10 over 3h = 3.3%/h
 eta_info=$(cu_eta_projection "seven_day" 3 "long" 2>/dev/null || true)
-assert_nonzero "spiky data 3h window has post-reset trend" "$eta_info"
+assert_nonzero "spiky 3h window with reset" "$eta_info"
 
 if [ -n "$eta_info" ]; then
     read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-    assert_eq "post-reset rate in 3h window = 5.0" "5.0" "$rate"
+    assert_range "spiky 3h: post-reset consumption only" "3.0" "3.5" "$rate"
 fi
 
-# Window=4h: reset at 50→15 discards pre-reset data; post-reset 15→25 over 2h = 5.0%/h
-# (2h effective / 4h requested = 50% coverage — above minimum threshold)
+# Window=4h: boundary at hour 0 (val=10). Pre-reset: 50-10=40. Post: 25-15=10.
+# Total=50 over 4h = 12.5%/h (counts BOTH sides of the reset)
 eta_info=$(cu_eta_projection "seven_day" 4 "long" 2>/dev/null)
-assert_nonzero "spiky data post-reset produces output" "$eta_info"
+assert_nonzero "spiky 4h window counts both sides" "$eta_info"
 
 if [ -n "$eta_info" ]; then
     read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-    assert_eq "post-reset rate = 5.0" "5.0" "$rate"
+    assert_eq "spiky 4h: pre+post reset consumption" "12.5" "$rate"
 fi
 
-# Window=10h with only 2h post-reset data — coverage check skipped after reset
+# Window=10h (clamped to 4h): same as above
 eta_info=$(cu_eta_projection "seven_day" 10 "long" 2>/dev/null)
-assert_nonzero "post-reset data accepted despite short span" "$eta_info"
+assert_nonzero "spiky large window counts both sides" "$eta_info"
 
 if [ -n "$eta_info" ]; then
     read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-    assert_eq "post-reset rate with large window = 5.0" "5.0" "$rate"
+    assert_eq "spiky 10h: pre+post reset consumption" "12.5" "$rate"
 fi
 
 echo ""
@@ -285,6 +286,38 @@ if [ -n "$eta_info" ]; then
 fi
 
 echo ""
+echo "=== Gap Handling: Both Sides of Reset Within Window ==="
+
+# Heavy day: 80%→100% (pre-reset +20%), reset to 0%, then 0%→16% (post +16%)
+# Total consumption = 36% over 24h = 1.5%/h
+> "$CU_HISTORY_LONG"
+local_base=1700000000
+# Pre-reset: 80→90→100 over 4 hours
+for i in 0 1 2; do
+    ts=$((local_base + i * 7200))  # 2h intervals
+    val=$((80 + i * 10))
+    echo "{\"ts\":$ts,\"seven_day\":{\"util\":$val,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+done
+# Reset at hour 6 (2h after hitting 100%)
+echo "{\"ts\":$((local_base + 6 * 3600)),\"seven_day\":{\"util\":0,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+# Post-reset: 0→8→16 over remaining 18 hours
+for i in 1 2; do
+    ts=$((local_base + 6 * 3600 + i * 9 * 3600))
+    val=$((i * 8))
+    echo "{\"ts\":$ts,\"seven_day\":{\"util\":$val,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+done
+export CU_NOW=$((local_base + 24 * 3600))
+
+eta_info=$(cu_eta_projection "seven_day" 24 "long" 2>/dev/null)
+assert_nonzero "both-sides-of-reset produces output" "$eta_info"
+
+if [ -n "$eta_info" ]; then
+    read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+    # Pre-reset: 100-80=20%. Post-reset: 16-0=16%. Total=36% over 24h = 1.5%/h
+    assert_eq "both sides: 20% pre + 16% post = 36%/24h" "1.5" "$rate"
+fi
+
+echo ""
 echo "=== Gap Handling: Reset Hidden in Gap ==="
 
 # Data before gap: 80%. Gap spans a reset. After gap: 5% → 8%
@@ -310,9 +343,11 @@ assert_nonzero "reset-in-gap produces output" "$eta_info"
 
 if [ -n "$eta_info" ]; then
     read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-    # 80% → 8% is a drop of 72 points — detected as reset.
-    # Post-reset: 5%→8% over 3h = 1.0%/h
-    assert_eq "reset-in-gap: rate based on post-reset data" "1.0" "$rate"
+    # 80%→5% is a drop of 75 points — detected as reset.
+    # Boundary is 24h ago: last known before that is 80% (hour 2).
+    # Pre-reset: val[reset-1]=80 - start=80 = 0% (all before window).
+    # Post-reset: 8-5 = 3%. Total = 3% over 24h = 0.125%/h
+    assert_range "reset-in-gap: both sides counted over 24h" "0.1" "0.2" "$rate"
 fi
 
 echo ""
