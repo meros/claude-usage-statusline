@@ -121,8 +121,8 @@ cu_eta_projection() {
         auto_tier=1
     fi
 
-    # Single jq call: extract ts, val, resets_at as TSV (replaces per-line jq loop)
-    local read_hours=$((avg_window + 1))
+    # Read extra history to bridge polling gaps (e.g. laptop sleep, weekends)
+    local read_hours=$((avg_window * 3))
     local tsv_data
     tsv_data=$(cu_history_read "$tier" "$read_hours" | \
         jq -r --arg f "$field" '
@@ -161,27 +161,43 @@ cu_eta_projection() {
             }
             if (seg == 0) seg = 1  # all data is after t_start
 
-            # Interpolate value at t_start within the boundary segment
-            # Skip interpolation across resets (drop > 30 points)
-            pos_change = 0
-            if (ts[seg-1] <= t_start && ts[seg] > t_start) {
-                delta = val[seg] - val[seg-1]
-                if (delta > 0) {
-                    # Proportional contribution of the partial segment
-                    frac = (ts[seg] - t_start) / (ts[seg] - ts[seg-1])
-                    pos_change += delta * frac
+            # Scan for the last reset (drop > 30 points) to find effective window start
+            # After a reset, only post-reset usage matters for ETA
+            last_reset_idx = -1
+            for (i = seg; i < n; i++) {
+                if (i > 0 && (val[i] - val[i-1]) < -30) {
+                    last_reset_idx = i
                 }
-                # Reset or flat segment: no contribution, start fresh at seg
             }
 
-            # Sum positive deltas for all complete segments within the window
-            for (i = seg + 1; i < n; i++) {
-                delta = val[i] - val[i-1]
-                if (delta > 0) pos_change += delta
+            # Determine effective window start value and timestamp
+            if (last_reset_idx >= 0) {
+                # Reset found — measure net change from reset point
+                start_val = val[last_reset_idx]
+                effective_start = ts[last_reset_idx]
+            } else if (ts[seg-1] <= t_start && ts[seg] > t_start && seg > 0) {
+                # Interpolate value at t_start within the boundary segment
+                frac = (t_start - ts[seg-1]) / (ts[seg] - ts[seg-1])
+                start_val = val[seg-1] + (val[seg] - val[seg-1]) * frac
+                effective_start = t_start
+            } else {
+                # Window starts at or before first data point
+                start_val = val[seg > 0 ? seg - 1 : 0]
+                effective_start = ts[seg > 0 ? seg - 1 : 0]
             }
-            if (pos_change <= 0) exit 1
 
-            rate = pos_change / win_hours
+            # Net change over the effective window (immune to micro-fluctuations)
+            net_change = val[n-1] - start_val
+            if (net_change <= 0) exit 1
+
+            win_hours = (t_end - effective_start) / 3600
+            if (win_hours <= 0) exit 1
+
+            # Require at least 25% of the requested window to be covered by data
+            # Prevents tiny data spans (e.g. 1h after a gap) from wildly inflating rates
+            if (win_hours < window * 0.25) exit 1
+
+            rate = net_change / win_hours
 
             remaining = 100 - val[n-1]
             if (remaining <= 0) exit 1

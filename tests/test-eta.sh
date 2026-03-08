@@ -149,21 +149,65 @@ for i in 0 1 2 3 4; do
 done
 export CU_NOW=$((local_base + 4 * 3600))
 
-# Window=3h: last 3 hours go from 50→25 (negative net change), no ETA
+# Window=3h: 50→15 is a reset; post-reset 15→20→25 = +10 over 2h = 5.0%/h
 eta_info=$(cu_eta_projection "seven_day" 3 "long" 2>/dev/null || true)
-assert_eq "spiky data with negative net change = no ETA" "" "$eta_info"
-
-# Full window: 10→25 over 4 hours = 3.75%/h
-eta_info=$(cu_eta_projection "seven_day" 10 "long" 2>/dev/null)
-assert_nonzero "spiky data full window produces output" "$eta_info"
+assert_nonzero "spiky data 3h window has post-reset trend" "$eta_info"
 
 if [ -n "$eta_info" ]; then
     read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-    assert_range "wall-clock rate over full window" "3.5" "4.0" "$rate"
+    assert_eq "post-reset rate in 3h window = 5.0" "5.0" "$rate"
+fi
+
+# Window=4h: reset at 50→15 discards pre-reset data; post-reset 15→25 over 2h = 5.0%/h
+# (2h effective / 4h requested = 50% coverage — above minimum threshold)
+eta_info=$(cu_eta_projection "seven_day" 4 "long" 2>/dev/null)
+assert_nonzero "spiky data post-reset produces output" "$eta_info"
+
+if [ -n "$eta_info" ]; then
+    read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+    assert_eq "post-reset rate = 5.0" "5.0" "$rate"
+fi
+
+# Window=10h with only 2h post-reset data (20% coverage) — too sparse, no output
+eta_info=$(cu_eta_projection "seven_day" 10 "long" 2>/dev/null || true)
+assert_eq "sparse post-reset data rejected" "" "$eta_info"
+
+echo ""
+echo "=== Noisy Data: Net Change Immune to Micro-Fluctuations ==="
+
+# Simulate API jitter: value goes 10, 12, 11, 14, 13, 16, 15, 18 over 7 hours
+# Net change = 8% over 7h = 1.14%/h, but sum-of-positive-deltas = 2+3+3+3 = 14%
+> "$CU_HISTORY_LONG"
+local_base=1700000000
+noisy_vals=(10 12 11 14 13 16 15 18)
+for i in "${!noisy_vals[@]}"; do
+    ts=$((local_base + i * 3600))
+    echo "{\"ts\":$ts,\"seven_day\":{\"util\":${noisy_vals[$i]},\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+done
+export CU_NOW=$((local_base + 7 * 3600))
+
+# Use window=10h so 7h of data gives 70% coverage (well above minimum)
+eta_info=$(cu_eta_projection "seven_day" 10 "long" 2>/dev/null)
+assert_nonzero "noisy data produces output" "$eta_info"
+
+if [ -n "$eta_info" ]; then
+    read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+    # Net: (18-10)/7h = 1.14%/h — must NOT be inflated by the fluctuations
+    assert_range "noisy data rate reflects net change, not positive-delta sum" "1.0" "1.2" "$rate"
 fi
 
 echo ""
 echo "=== Configurable Window Size ==="
+
+# Restore spiky data for this test: 10, 50, 15, 20, 25
+> "$CU_HISTORY_LONG"
+local_base=1700000000
+vals=(10 50 15 20 25)
+for i in 0 1 2 3 4; do
+    ts=$((local_base + i * 3600))
+    echo "{\"ts\":$ts,\"seven_day\":{\"util\":${vals[$i]},\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+done
+export CU_NOW=$((local_base + 4 * 3600))
 
 # Window=1h: last hour 20→25 = 5.0%/h
 eta_info=$(cu_eta_projection "seven_day" 1 "long" 2>/dev/null)
