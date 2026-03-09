@@ -85,7 +85,7 @@ cu_history_prune() {
     if [ -f "$CU_HISTORY_SHORT" ]; then
         local cutoff=$((now - CU_SHORT_MAX_AGE))
         local tmp="${CU_HISTORY_SHORT}.tmp"
-        if jq -c --argjson cutoff "$cutoff" 'select(.ts >= $cutoff)' "$CU_HISTORY_SHORT" > "$tmp" 2>/dev/null; then
+        if jq -R -c --argjson cutoff "$cutoff" 'fromjson? | select(.ts >= $cutoff)' "$CU_HISTORY_SHORT" > "$tmp" 2>/dev/null; then
             mv "$tmp" "$CU_HISTORY_SHORT"
         else
             rm -f "$tmp"
@@ -96,7 +96,7 @@ cu_history_prune() {
     if [ -f "$CU_HISTORY_LONG" ]; then
         local cutoff=$((now - CU_LONG_MAX_AGE))
         local tmp="${CU_HISTORY_LONG}.tmp"
-        if jq -c --argjson cutoff "$cutoff" 'select(.ts >= $cutoff)' "$CU_HISTORY_LONG" > "$tmp" 2>/dev/null; then
+        if jq -R -c --argjson cutoff "$cutoff" 'fromjson? | select(.ts >= $cutoff)' "$CU_HISTORY_LONG" > "$tmp" 2>/dev/null; then
             mv "$tmp" "$CU_HISTORY_LONG"
         else
             rm -f "$tmp"
@@ -117,7 +117,7 @@ cu_history_read() {
     esac
 
     [ -f "$file" ] || return 0
-    jq -c --argjson cutoff "$cutoff" 'select(.ts >= $cutoff)' "$file" 2>/dev/null
+    jq -R -c --argjson cutoff "$cutoff" 'fromjson? | select(.ts >= $cutoff)' "$file" 2>/dev/null
 }
 
 cu_history_values() {
