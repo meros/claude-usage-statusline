@@ -40,7 +40,8 @@ cu_history_record() {
         local write_short=1
         if [ -f "$CU_HISTORY_SHORT" ]; then
             local last_ts
-            last_ts=$(tail -1 "$CU_HISTORY_SHORT" 2>/dev/null | jq -r '.ts // 0' 2>/dev/null)
+            last_ts=$(tail -1 "$CU_HISTORY_SHORT" 2>/dev/null | tr -d '\0' | jq -r '.ts // 0' 2>/dev/null)
+            last_ts="${last_ts:-0}"
             local last_bucket=$((last_ts / CU_SHORT_INTERVAL))
             [ "$short_bucket" = "$last_bucket" ] && write_short=0
         fi
@@ -63,7 +64,8 @@ cu_history_record() {
         local write_long=1
         if [ -f "$CU_HISTORY_LONG" ]; then
             local last_ts
-            last_ts=$(tail -1 "$CU_HISTORY_LONG" 2>/dev/null | jq -r '.ts // 0' 2>/dev/null)
+            last_ts=$(tail -1 "$CU_HISTORY_LONG" 2>/dev/null | tr -d '\0' | jq -r '.ts // 0' 2>/dev/null)
+            last_ts="${last_ts:-0}"
             local last_bucket=$((last_ts / CU_LONG_INTERVAL))
             [ "$long_bucket" = "$last_bucket" ] && write_long=0
         fi
