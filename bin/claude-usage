@@ -426,6 +426,40 @@ cmd_history_view() {
     fi
 }
 
+cmd_debug_template() {
+    parse_flags "$@"
+
+    if [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
+        if cu_fetch; then
+            local cache_data
+            cache_data=$(cu_read_cache)
+            [ -n "$cache_data" ] && cu_history_record "$cache_data"
+        fi
+    fi
+
+    local data
+    data=$(cu_read_cache)
+    if [ -z "$data" ]; then
+        echo "No cached usage data. Run 'claude-usage fetch' first." >&2
+        return 1
+    fi
+
+    local util reset_at secs_to_reset
+    util=$(echo "$data" | jq -r '.seven_day.utilization // 0')
+    reset_at=$(echo "$data" | jq -r '.seven_day.resets_at // ""')
+    if [ -z "$reset_at" ]; then
+        echo "No seven_day.resets_at in cache — cannot debug template." >&2
+        return 1
+    fi
+    secs_to_reset=$(cu_secs_until_reset "$reset_at")
+    if [ "${secs_to_reset:-0}" -le 0 ]; then
+        echo "seven_day reset is at or in the past — nothing to project." >&2
+        return 1
+    fi
+
+    cu_debug_template_seven_day "${util%.*}" "$secs_to_reset"
+}
+
 cmd_install_hook() {
     parse_flags "$@"
     local settings_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
@@ -468,6 +502,7 @@ Commands:
   fetch         Force-fetch + record history
   history       Dump raw JSONL history
   history-view  Formatted history table with sparklines (alias: hv)
+  debug-template  Trace the seasonal-template ETA (alias: dt)
   install-hook  Configure ~/.claude/settings.json
 
 Flags:
@@ -526,6 +561,7 @@ case "$subcommand" in
     fetch)          cmd_fetch "$@" ;;
     history)        cmd_history "$@" ;;
     history-view|hv) cmd_history_view "$@" ;;
+    debug-template|dt) cmd_debug_template "$@" ;;
     install-hook)   cmd_install_hook "$@" ;;
     help|--help|-h) cmd_help ;;
     *)

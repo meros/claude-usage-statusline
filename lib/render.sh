@@ -395,6 +395,148 @@ cu_eta_template_seven_day() {
     return 0
 }
 
+# Debug dump for cu_eta_template_seven_day. Prints inputs, bucket means, and
+# the hour-by-hour projection walk to stdout. Same data and rules as the
+# production function — when output diverges, the production function is
+# wrong.
+#
+# Args: current_util, secs_to_reset
+cu_debug_template_seven_day() {
+    local current_util="${1:-0}" secs_to_reset="${2:-0}"
+    local now
+    now=$(cu_now)
+    local lookback_hours=$((28 * 24))
+
+    printf "=== Inputs ===\n"
+    printf "now             : %d (%s)\n" "$now" "$(date -d "@$now" '+%a %Y-%m-%d %H:%M %Z' 2>/dev/null || echo '?')"
+    printf "current util    : %s%%\n" "$current_util"
+    printf "secs_to_reset   : %d (%s)\n" "$secs_to_reset" "$(cu_fmt_duration "$secs_to_reset" 2>/dev/null || echo '?')"
+    printf "lookback        : %dh (%dd)\n" "$lookback_hours" "$((lookback_hours / 24))"
+    echo
+
+    local tsv
+    tsv=$(cu_history_read long "$lookback_hours" | \
+        jq -r 'select(.seven_day != null and .seven_day.util != null) |
+            (.ts | localtime) as $lt |
+            [.ts, .seven_day.util, ($lt[6] * 24 + $lt[3])] | @tsv' 2>/dev/null)
+
+    if [ -z "$tsv" ]; then
+        printf "No long-tier seven_day history available — template cannot run.\n"
+        return 1
+    fi
+
+    local n_records distinct_days
+    n_records=$(printf '%s\n' "$tsv" | wc -l)
+    distinct_days=$(printf '%s\n' "$tsv" | awk -F'\t' '{print int($1/86400)}' | sort -u | wc -l)
+
+    printf "=== Template input ===\n"
+    printf "records          : %d\n" "$n_records"
+    printf "distinct days    : %d\n" "$distinct_days"
+    if [ "$distinct_days" -lt 3 ]; then
+        printf "\nFewer than 3 distinct days — production function would bail.\n"
+    fi
+    echo
+
+    printf "=== Hour-of-week bucket means (only non-empty) ===\n"
+    printf "Bucket layout: bucket = weekday(0=Sun..6=Sat) * 24 + hour-of-day\n\n"
+
+    printf '%s\n' "$tsv" | awk -F'\t' '
+        BEGIN {
+            for (i = 0; i < 168; i++) { sum[i]=0; cnt[i]=0 }
+            days[0]="Sun"; days[1]="Mon"; days[2]="Tue"; days[3]="Wed"
+            days[4]="Thu"; days[5]="Fri"; days[6]="Sat"
+        }
+        NF >= 3 { ts[n]=$1+0; val[n]=$2+0; buc[n]=$3+0; n++ }
+        END {
+            for (i = 1; i < n; i++) {
+                if (val[i-1] == 0 && val[i] == 0) continue
+                gap = ts[i] - ts[i-1]
+                if (gap <= 0 || gap > 7200) continue
+                d = val[i] - val[i-1]
+                if (d < 0) continue
+                sum[buc[i]] += d
+                cnt[buc[i]]++
+            }
+            nonempty = 0
+            for (b = 0; b < 168; b++) {
+                if (cnt[b] > 0) {
+                    nonempty++
+                    printf "  bucket %3d  %s %02d:00  mean=%.3f%%/h  obs=%d\n",
+                        b, days[int(b/24)], b % 24, sum[b]/cnt[b], cnt[b]
+                }
+            }
+            printf "\n  filled buckets: %d/168  (empty buckets fall back to 0%%/h)\n",
+                nonempty
+        }'
+
+    echo
+    printf "=== Forward projection walk ===\n"
+    printf "Starting at util=%s%%, walking forward hour-by-hour to reset.\n\n" "$current_util"
+
+    printf '%s\n' "$tsv" | awk -F'\t' \
+        -v now="$now" \
+        -v current_util="$current_util" \
+        -v secs_to_reset="$secs_to_reset" '
+        BEGIN {
+            for (i = 0; i < 168; i++) { sum[i]=0; cnt[i]=0 }
+            days[0]="Sun"; days[1]="Mon"; days[2]="Tue"; days[3]="Wed"
+            days[4]="Thu"; days[5]="Fri"; days[6]="Sat"
+        }
+        NF >= 3 { ts[n]=$1+0; val[n]=$2+0; buc[n]=$3+0; n++ }
+        END {
+            for (i = 1; i < n; i++) {
+                if (val[i-1] == 0 && val[i] == 0) continue
+                gap = ts[i] - ts[i-1]
+                if (gap <= 0 || gap > 7200) continue
+                d = val[i] - val[i-1]
+                if (d < 0) continue
+                sum[buc[i]] += d
+                cnt[buc[i]]++
+            }
+            for (b = 0; b < 168; b++) burn[b] = (cnt[b] > 0) ? sum[b]/cnt[b] : 0
+
+            projected = current_util + 0
+            t = now
+            t_reset = now + secs_to_reset
+            anchor_ts = ts[n-1]
+            anchor_buc = buc[n-1]
+            max_steps = int(secs_to_reset / 3600) + 24
+
+            printf "  step  hour-of-week         expected   util-after  fallback?\n"
+            for (step = 0; step < max_steps; step++) {
+                hours_since = int((t - anchor_ts + 1800) / 3600)
+                b = anchor_buc + hours_since
+                b = ((b % 168) + 168) % 168
+                expected = burn[b]
+                fb = (cnt[b] == 0) ? "yes" : ""
+                new_util = projected + expected
+                label = sprintf("%s %02d:00 (b=%d)", days[int(b/24)], b % 24, b)
+
+                if (new_util >= 100) {
+                    if (expected > 0) frac = (100 - projected) / expected
+                    else frac = 0
+                    if (frac < 0) frac = 0
+                    if (frac > 1) frac = 1
+                    hit_secs = (t - now) + int(frac * 3600)
+                    printf "  %3d   %-22s %.3f     %.2f%%       %s  <-- HIT (frac=%.2f)\n",
+                        step, label, expected, new_util, fb, frac
+                    printf "\n  *** Cap projected to hit at %s after %d secs (before reset) ***\n",
+                        strftime("%a %Y-%m-%d %H:%M", now + hit_secs), hit_secs
+                    exit 0
+                }
+                printf "  %3d   %-22s %.3f     %.2f%%       %s\n",
+                    step, label, expected, new_util, fb
+                projected = new_util
+                t += 3600
+                if (t >= t_reset) {
+                    printf "\n  *** Reached reset at %s without crossing 100%%. Final projected util=%.2f%% ***\n",
+                        strftime("%a %H:%M", t_reset), projected
+                    exit 0
+                }
+            }
+        }'
+}
+
 cu_braille_sparkline() {
     # Compact sparkline using 8-dot Braille characters — 2 data points per column.
     # Left column uses dots 7,3,2,1 (bottom-up), right column uses dots 8,6,5,4.
