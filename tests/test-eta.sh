@@ -459,6 +459,77 @@ eta_info=$(cu_eta_projection "seven_day" 10 2>/dev/null)
 assert_nonzero "seven_day falls back to long tier" "$eta_info"
 
 echo ""
+echo "=== Seasonal Template ETA (seven_day hour-of-week buckets) ==="
+
+# Template needs ≥3 distinct days of long-tier data. Below that, returns
+# nothing so the caller falls back to flat-rate ETA.
+> "$CU_HISTORY_LONG"
+local_base=1700000000
+# 2 days of data → insufficient
+for i in 0 1; do
+    ts=$((local_base + i * 86400))
+    echo "{\"ts\":$ts,\"seven_day\":{\"util\":$((i * 5)),\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+done
+export CU_NOW=$((local_base + 1 * 86400))
+
+tmpl=$(cu_eta_template_seven_day 5 86400 2>/dev/null || true)
+assert_eq "template bails on <3 days of data" "" "$tmpl"
+
+# Synthetic 4-week pattern: heavy use 09:00-17:00 weekdays (each hour +1%),
+# zero elsewhere. Weekly reset Sunday midnight (drop counts as a reset, gets
+# filtered by the negative-delta rule).
+> "$CU_HISTORY_LONG"
+local_base=$(date -d "2025-12-01 00:00:00" +%s 2>/dev/null || gdate -d "2025-12-01 00:00:00" +%s)
+util=0
+for d in $(seq 0 27); do
+    for h in $(seq 0 23); do
+        ts=$((local_base + d * 86400 + h * 3600))
+        wd=$(date -d "@$ts" +%u 2>/dev/null || gdate -d "@$ts" +%u)
+        # Weekly reset Sunday (wd=7) at midnight
+        if [ "$wd" -eq 7 ] && [ "$h" -eq 0 ]; then util=0; fi
+        # Increment util by 1 during business hours on weekdays
+        if [ "$wd" -ge 1 ] && [ "$wd" -le 5 ] && [ "$h" -ge 9 ] && [ "$h" -lt 17 ]; then
+            util=$((util + 1))
+        fi
+        echo "{\"ts\":$ts,\"seven_day\":{\"util\":$util,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+    done
+done
+
+# Run the template at Monday 09:00 (start of a workday) with 70% util
+# and 7 days until reset. Each weekday contributes 8% (8h × +1%/h), so
+# 70 + 5×8 = 110% — projected to hit 100% partway through Friday.
+mon_0900=$(date -d "2025-12-29 09:00:00" +%s 2>/dev/null || gdate -d "2025-12-29 09:00:00" +%s)
+export CU_NOW=$mon_0900
+secs_to_reset=$((7 * 86400))
+
+tmpl=$(cu_eta_template_seven_day 70 $secs_to_reset 2>/dev/null)
+assert_nonzero "template returns output with 4 weeks of data" "$tmpl"
+
+if [ -n "$tmpl" ]; then
+    read -r t_secs t_flag <<< "$tmpl"
+    # Cap-hit projected somewhere between Mon end-of-day and Fri end-of-day.
+    # Mon 17:00 = 28800s, Fri 17:00 = 4*86400 + 28800 = 374400s.
+    assert_range "template projects cap-hit before reset" "28800" "374400" "$t_secs"
+    assert_eq "template flags before-reset hit" "1" "$t_flag"
+fi
+
+# At Saturday 02:00 with low util, template should NOT predict cap before
+# reset (no consumption in upcoming weekend hours, weekly reset Sun midnight).
+sat_0200=$(date -d "2026-01-03 02:00:00" +%s 2>/dev/null || gdate -d "2026-01-03 02:00:00" +%s)
+export CU_NOW=$sat_0200
+# Reset on Sunday midnight (~22h from now); util only 5%
+secs_to_reset=$((22 * 3600))
+
+tmpl=$(cu_eta_template_seven_day 5 $secs_to_reset 2>/dev/null)
+assert_nonzero "template returns output for weekend window" "$tmpl"
+
+if [ -n "$tmpl" ]; then
+    read -r t_secs t_flag <<< "$tmpl"
+    assert_eq "weekend low-util: no cap-hit projected" "0" "${t_secs}"
+    assert_eq "weekend low-util: before-reset flag empty" "" "${t_flag:-}"
+fi
+
+echo ""
 echo "=== Duration Formatting ==="
 
 result=$(cu_fmt_duration 3661)

@@ -195,7 +195,14 @@ _render_mod_reset() {
         "$(cu_color "${CU_COLOR_RESET}")" "$reset_str" "$(cu_reset)"
 }
 
-# Compute ETA projection, storing results in shared variables
+# Compute ETA projection, storing results in shared variables.
+#
+# Two-track approach:
+#   - rate module always reflects instantaneous burn (sum of positive deltas
+#     over the rate window) — so the user sees what their pace is *right now*.
+#   - eta module's secs/before_reset come from the seasonal template for
+#     seven_day when enough history is available; otherwise from the same
+#     flat-rate extrapolation as the rate module.
 _compute_eta() {
     local field="$1" avg_window="$2"
     _eta_rate="" _eta_hours="" _eta_secs="" _before_reset=""
@@ -206,6 +213,25 @@ _compute_eta() {
     else
         # No projection available — set rate to 0 so rate module still displays
         _eta_rate="0"
+    fi
+
+    # For seven_day, replace the flat-rate ETA with a seasonal template
+    # forecast that accounts for hour-of-day + day-of-week patterns.
+    if [ "$field" = "seven_day" ] && [ -n "${_win_reset:-}" ]; then
+        local secs_to_reset
+        secs_to_reset=$(cu_secs_until_reset "$_win_reset")
+        if [ "${secs_to_reset:-0}" -gt 0 ] 2>/dev/null; then
+            local current_util="${_win_pct%.*}"
+            local tmpl
+            tmpl=$(cu_eta_template_seven_day "${current_util:-0}" "$secs_to_reset" 2>/dev/null || true)
+            if [ -n "$tmpl" ]; then
+                # tmpl: "secs_to_cap before_reset_flag"  (secs=0 → no hit)
+                local _t_secs _t_flag
+                read -r _t_secs _t_flag <<< "$tmpl"
+                _eta_secs="${_t_secs:-0}"
+                _before_reset="${_t_flag:-}"
+            fi
+        fi
     fi
 }
 

@@ -223,6 +223,178 @@ cu_eta_projection() {
     printf "%s %s %s %s\n" "$rate" "$hours_to_cap" "$secs_to_cap" "${before_reset:+1}"
 }
 
+# Seasonal template ETA: hour-of-week bucket forecast.
+#
+# The seven_day cap has a strong weekly + diurnal pattern: usage clusters into
+# work hours and slacks off at night and on weekends. A flat-rate extrapolation
+# either over- or under-projects depending on what time of day the forecast is
+# made.
+#
+# Approach: "Seasonal Mean" forecasting (Hyndman & Athanasopoulos, FPP3, §5.2)
+# with weekly seasonality (period = 168 hours).
+#   1. Read the last 4 weeks of hourly history.
+#   2. For each hour of the week (0..167, Sunday 00:00 = bucket 0), compute the
+#      mean positive delta observed in that bucket. Negative deltas are skipped
+#      (they're either resets or sliding-window decay — same rule as the rate
+#      calc, applied uniformly).
+#   3. Walk forward hour by hour from now until the weekly reset, accumulating
+#      bucket means onto the current util. The first hour the running total
+#      crosses 100 is the projected cap-hit time.
+#   4. If the projection completes the walk without crossing 100, no cap hit
+#      before reset → return secs_to_cap=0 (the eta module hides itself).
+#
+# This is the simplest seasonality-aware forecast that captures both the
+# day-of-week and time-of-day variation the user observes.
+#
+# Coldstart: needs ≥3 weeks of long-tier data to be meaningful. Caller is
+# expected to fall back to cu_eta_projection until that's available.
+#
+# Args: current_util, secs_to_reset
+# Output (stdout, single line): "secs_to_cap before_reset_flag" — empty on
+# insufficient data, "0 " when cap is not projected to hit before reset.
+cu_eta_template_seven_day() {
+    local current_util="${1:-0}" secs_to_reset="${2:-0}"
+    [ "${secs_to_reset%.*}" -gt 0 ] 2>/dev/null || return 1
+
+    # 4 weeks of hourly history is the template's working window. More data
+    # would average out behavior shifts (e.g. job change, project ramp); less
+    # leaves buckets too sparse to be reliable.
+    local lookback_hours=$((28 * 24))
+
+    # jq emits TSV: ts, util, bucket (0..167, localtime hour-of-week).
+    # localtime returns [year, month, day, hour, min, sec, weekday, yearday];
+    # weekday is 0=Sunday..6=Saturday.
+    local tsv
+    tsv=$(cu_history_read long "$lookback_hours" | \
+        jq -r 'select(.seven_day != null and .seven_day.util != null) |
+            (.ts | localtime) as $lt |
+            [.ts, .seven_day.util, ($lt[6] * 24 + $lt[3])] | @tsv' 2>/dev/null)
+
+    [ -z "$tsv" ] && return 1
+
+    # Need ≥3 distinct days of data — bail otherwise.
+    local distinct_days
+    distinct_days=$(printf '%s\n' "$tsv" | awk -F'\t' '{print int($1/86400)}' | sort -u | wc -l)
+    [ "$distinct_days" -ge 3 ] || return 1
+
+    local now
+    now=$(cu_now)
+
+    local result
+    result=$(printf '%s\n' "$tsv" | awk -F'\t' \
+        -v now="$now" \
+        -v current_util="$current_util" \
+        -v secs_to_reset="$secs_to_reset" '
+        BEGIN {
+            n = 0
+            for (i = 0; i < 168; i++) { sum[i] = 0; cnt[i] = 0 }
+        }
+        NF >= 3 {
+            ts[n] = $1 + 0
+            val[n] = $2 + 0
+            buc[n] = $3 + 0
+            n++
+        }
+        END {
+            if (n < 2) exit 1
+
+            # --- Build the hour-of-week bucket means ---
+            # For each consecutive pair, attribute the delta to the bucket of
+            # the later record. Rules:
+            #   - Skip pairs with gap > 2h (laptop sleep / data outage); the
+            #     delta is real but cannot be attributed to a single bucket.
+            #   - Skip pairs where both vals are 0. These are pre-activity
+            #     startup samples (or post-reset quiet hours that carry no
+            #     signal yet). Counting them as observed-quiet would falsely
+            #     anchor the bucket mean at zero before any real data arrived.
+            #   - Skip negative deltas (reset boundaries / sliding-window decay).
+            #   - Zero deltas between two non-zero values DO count as a
+            #     genuine observation of a quiet active hour.
+            for (i = 1; i < n; i++) {
+                if (val[i-1] == 0 && val[i] == 0) continue
+                gap = ts[i] - ts[i-1]
+                if (gap <= 0 || gap > 7200) continue
+                d = val[i] - val[i-1]
+                if (d < 0) continue
+                b = buc[i]
+                sum[b] += d
+                cnt[b]++
+            }
+
+            # Per-bucket mean; empty buckets fall back to 0 (no observed
+            # activity for this hour-of-week, so do not speculate). Bail if
+            # every bucket is zero, since there is nothing to project from.
+            total_burn = 0
+            for (b = 0; b < 168; b++) {
+                if (cnt[b] > 0) {
+                    burn[b] = sum[b] / cnt[b]
+                    total_burn += burn[b]
+                } else {
+                    burn[b] = 0
+                }
+            }
+            if (total_burn <= 0) exit 1
+
+            # --- Walk forward from now to next reset ---
+            projected = current_util + 0
+            t = now
+            t_reset = now + secs_to_reset
+
+            # Use the same localtime convention jq used (server local time).
+            # mktime/strftime in gawk handle this; for portability we recompute
+            # weekday/hour from epoch using an offset derived from the most
+            # recent record (which jq already converted for us).
+            # Anchor: the last record (ts[n-1] -> buc[n-1]). Subsequent hours
+            # advance buc by 1 mod 168.
+            anchor_ts = ts[n-1]
+            anchor_buc = buc[n-1]
+
+            hit_secs = -1
+            max_steps = int(secs_to_reset / 3600) + 24
+
+            for (step = 0; step < max_steps; step++) {
+                # Hours elapsed since the anchor record (rounded).
+                # Use floor((t - anchor_ts) / 3600) so the bucket aligns to
+                # the hour we are *entering*.
+                hours_since = int((t - anchor_ts + 1800) / 3600)
+                b = anchor_buc + hours_since
+                # awk modulo of negatives differs across implementations
+                b = ((b % 168) + 168) % 168
+
+                expected = burn[b]
+                if (projected + expected >= 100) {
+                    # Cap hits inside this hour — interpolate the fraction.
+                    if (expected > 0) {
+                        frac = (100 - projected) / expected
+                        if (frac < 0) frac = 0
+                        if (frac > 1) frac = 1
+                        hit_secs = (t - now) + int(frac * 3600)
+                    } else {
+                        hit_secs = t - now
+                    }
+                    break
+                }
+                projected += expected
+                t += 3600
+                if (t >= t_reset) break
+            }
+
+            if (hit_secs < 0) {
+                # Walked to reset without crossing — no cap-hit before reset.
+                printf "0 "
+            } else if (hit_secs >= secs_to_reset) {
+                printf "0 "
+            } else {
+                # Cap projected to hit before reset.
+                printf "%d 1", hit_secs
+            }
+        }' 2>/dev/null)
+
+    [ -z "$result" ] && return 1
+    printf "%s\n" "$result"
+    return 0
+}
+
 cu_braille_sparkline() {
     # Compact sparkline using 8-dot Braille characters — 2 data points per column.
     # Left column uses dots 7,3,2,1 (bottom-up), right column uses dots 8,6,5,4.
