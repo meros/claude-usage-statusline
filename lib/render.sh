@@ -129,22 +129,21 @@ cu_eta_projection() {
             select(.[$f] != null and .[$f].util != null) |
             [.ts, .[$f].util, (.[$f].resets_at // "")] | @tsv' 2>/dev/null)
 
-    # Compute rate via net change over the averaging window.
+    # Compute rate as sum-of-positive-deltas over the averaging window.
     #
     # Key design decisions:
-    #   - Net change (end − start) instead of sum-of-positive-deltas, so API
-    #     value jitter doesn't inflate the rate.
-    #   - Reset detection: if a drop > 30 points occurs in the data, only
-    #     post-reset usage counts (pre-reset consumption is irrelevant to
-    #     current time-to-cap).
-    #   - Gaps (laptop sleep, weekends): we find the last known value AT OR
-    #     BEFORE the window boundary — no interpolation across gaps, because
-    #     utilization doesn't change while the machine is off.
-    #   - The denominator is always wall-clock hours (window size or time
-    #     since reset), so %/1d means "consumption per calendar day" including
-    #     idle time.
-    #   - Minimum data requirement: need at least 2 distinct values within the
-    #     effective window (otherwise can't compute a rate).
+    #   - Only positive deltas count toward consumption. Any negative delta
+    #     is treated as a reset boundary (5h hard reset, 7d sliding decay,
+    #     or API value correction) — no magnitude threshold, no resets_at
+    #     comparison. Downward movement is never "consumption".
+    #   - Boundary handling: we include the record immediately before the
+    #     window start as a "before" anchor, so a positive delta straddling
+    #     t_start still counts. This captures consumption that happened
+    #     right at the window edge.
+    #   - Denominator is always wall-clock window hours, so %/1d means
+    #     "consumption per calendar day" — idle time counts as no use.
+    #   - No data / no positive deltas → rate=0 (caller renders "0%/Xh"
+    #     rather than hiding the module).
     local result
     result=$(printf '%s\n' "$tsv_data" | awk -F'\t' -v window="$avg_window" '
         BEGIN { n = 0 }
@@ -154,77 +153,48 @@ cu_eta_projection() {
             n++
         }
         END {
-            if (n < 2) exit 1
+            if (n < 1) {
+                printf "0 0 0 "
+                exit 0
+            }
 
             t_end = ts[n-1]
             t_start = t_end - window * 3600
 
-            # --- Reset detection (scan ALL loaded data) ---
-            # Find the last reset (drop > 30 points). If a reset occurred,
-            # only post-reset data matters for predicting time-to-cap.
-            last_reset = -1
-            for (i = 1; i < n; i++) {
-                if ((val[i] - val[i-1]) < -30) last_reset = i
+            # Find the anchor: last record at or before t_start (the "before"
+            # value). Records strictly inside (t_start, t_end] are the "after"
+            # values whose deltas we sum.
+            anchor = -1
+            for (i = 0; i < n; i++) {
+                if (ts[i] <= t_start) anchor = i
+                else break
+            }
+            # If no record predates t_start, start from the first record —
+            # we lose the leading delta but the rest of the window is valid.
+            first_in = (anchor >= 0) ? anchor + 1 : 1
+
+            consumption = 0
+            for (i = first_in; i < n; i++) {
+                d = val[i] - val[i-1]
+                # Negative delta = reset boundary. Skip it (do not count
+                # downward movement, do not treat as consumption).
+                if (d > 0) consumption += d
             }
 
-            # --- Find the boundary value at the window start ---
-            # Use the last known data point AT OR BEFORE t_start
-            # (no interpolation across gaps — value is flat while offline).
-            if (t_start <= ts[0]) {
-                start_val = val[0]
-                effective_start = ts[0]
-            } else {
-                boundary = 0
-                for (i = 0; i < n; i++) {
-                    if (ts[i] <= t_start) boundary = i
-                    else break
-                }
-                start_val = val[boundary]
-                effective_start = t_start  # wall-clock window start
-            }
+            # Wall-clock window for the rate denominator.
+            win_hours = window
 
-            # --- Compute total consumption within the window ---
-            # If a reset occurred, we need BOTH sides:
-            #   pre-reset consumption + post-reset consumption.
-            # Without a reset, it is simply net change end−start.
-            #
-            # Example: window has 80%→100% (pre-reset +20%), reset to 0%,
-            # then 0%→16% (post-reset +16%) → total consumption = 36%.
-            total_consumption = 0
-            if (last_reset >= 0 && ts[last_reset] >= effective_start) {
-                # Reset(s) inside the window — sum consumption on each side
-                # Pre-reset: from start_val to the value just before reset
-                pre_reset_val = val[last_reset - 1]
-                pre = pre_reset_val - start_val
-                if (pre > 0) total_consumption += pre
-
-                # Post-reset: from reset value to current
-                post = val[n-1] - val[last_reset]
-                if (post > 0) total_consumption += post
-
-                has_recent_reset = 1
-            } else {
-                total_consumption = val[n-1] - start_val
-                has_recent_reset = 0
-            }
-            if (total_consumption <= 0) exit 1
-
-            win_hours = (t_end - effective_start) / 3600
-            if (win_hours <= 0) exit 1
-
-            # Minimum data span: need at least 25% of requested window
-            # covered, otherwise the projection is unreliable.
-            # Exception: reset within the window — post-reset span may be
-            # short but we already have the full consumption picture.
-            if (!has_recent_reset && win_hours < window * 0.25) exit 1
-
-            rate = total_consumption / win_hours
+            rate = (consumption > 0) ? consumption / win_hours : 0
 
             remaining = 100 - val[n-1]
-            if (remaining <= 0) exit 1
-            hours_to_cap = remaining / rate
-            secs_to_cap = int(hours_to_cap * 3600)
-            printf "%.1f %.1f %d", rate, hours_to_cap, secs_to_cap
+            if (rate > 0 && remaining > 0) {
+                hours_to_cap = remaining / rate
+                secs_to_cap = int(hours_to_cap * 3600)
+            } else {
+                hours_to_cap = 0
+                secs_to_cap = 0
+            }
+            printf "%.4f %.1f %d", rate, hours_to_cap, secs_to_cap
         }' 2>/dev/null)
     if [ -z "$result" ]; then
         if [ "$auto_tier" = "1" ] && [ "$tier" = "short" ]; then
@@ -241,7 +211,7 @@ cu_eta_projection() {
     local reset_at
     reset_at=$(printf '%s\n' "$tsv_data" | tail -1 | cut -f3)
     local before_reset=""
-    if [ -n "$reset_at" ]; then
+    if [ -n "$reset_at" ] && [ "${secs_to_cap:-0}" -gt 0 ] 2>/dev/null; then
         local secs_to_reset
         secs_to_reset=$(cu_secs_until_reset "$reset_at")
         if [ "$secs_to_cap" -lt "$secs_to_reset" ] 2>/dev/null; then

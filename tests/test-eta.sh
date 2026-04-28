@@ -109,9 +109,11 @@ assert_nonzero "constant rate produces output" "$eta_info"
 
 if [ -n "$eta_info" ]; then
     read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-    assert_eq "constant rate = 5.0" "5.0" "$rate"
-    assert_eq "constant ETA hours = 14.0" "14.0" "$eta_hours"
-    assert_eq "constant ETA secs = 50400" "50400" "$eta_secs"
+    # Sum of positive deltas: 5+5+5+5 = 20. Wall-clock window = 10h.
+    # rate = 20/10 = 2.0 %/h. remaining = 100-30 = 70. hours = 70/2 = 35h.
+    assert_range "constant rate = 2.0%/h (sum-of-positives over 10h window)" "1.99" "2.01" "$rate"
+    assert_range "constant ETA hours = 35.0" "34.9" "35.1" "$eta_hours"
+    assert_range "constant ETA secs = 126000" "125900" "126100" "$eta_secs"
 fi
 
 echo ""
@@ -132,8 +134,8 @@ assert_nonzero "five_hour constant rate from short tier" "$eta_info"
 
 if [ -n "$eta_info" ]; then
     read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-    assert_eq "five_hour short tier rate = 5.0" "5.0" "$rate"
-    assert_eq "five_hour short tier ETA hours = 14.0" "14.0" "$eta_hours"
+    assert_range "five_hour short tier rate = 2.0%/h" "1.99" "2.01" "$rate"
+    assert_range "five_hour short tier ETA hours = 35h" "34.9" "35.1" "$eta_hours"
 fi
 
 echo ""
@@ -149,40 +151,43 @@ for i in 0 1 2 3 4; do
 done
 export CU_NOW=$((local_base + 4 * 3600))
 
-# Window=3h: boundary at hour 1 (val=50). Reset 50→15. Pre-reset: 50-50=0.
-# Post-reset: 25-15=10. Total=10 over 3h = 3.3%/h
+# Window=3h: anchor at hour 1 (val=50). Positive deltas i=2,3,4: -35(skip),
+# +5,+5 = 10. Wall-clock = 3h. rate = 10/3 = 3.33%/h
 eta_info=$(cu_eta_projection "seven_day" 3 "long" 2>/dev/null || true)
 assert_nonzero "spiky 3h window with reset" "$eta_info"
 
 if [ -n "$eta_info" ]; then
     read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-    assert_range "spiky 3h: post-reset consumption only" "3.0" "3.5" "$rate"
+    assert_range "spiky 3h: post-reset positive deltas only" "3.2" "3.4" "$rate"
 fi
 
-# Window=4h: boundary at hour 0 (val=10). Pre-reset: 50-10=40. Post: 25-15=10.
-# Total=50 over 4h = 12.5%/h (counts BOTH sides of the reset)
+# Window=4h: anchor at hour 0 (val=10). Positive deltas i=1..4: +40, -35(skip),
+# +5, +5 = 50. Wall-clock = 4h. rate = 50/4 = 12.5%/h
 eta_info=$(cu_eta_projection "seven_day" 4 "long" 2>/dev/null)
 assert_nonzero "spiky 4h window counts both sides" "$eta_info"
 
 if [ -n "$eta_info" ]; then
     read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-    assert_eq "spiky 4h: pre+post reset consumption" "12.5" "$rate"
+    assert_range "spiky 4h: positive-deltas-only consumption" "12.4" "12.6" "$rate"
 fi
 
-# Window=10h (clamped to 4h): same as above
+# Window=10h: no anchor (data starts at base, t_start=base-6h). Same positive
+# deltas (+40,+5,+5 = 50) but wall-clock = 10h, so rate = 5.0%/h
 eta_info=$(cu_eta_projection "seven_day" 10 "long" 2>/dev/null)
 assert_nonzero "spiky large window counts both sides" "$eta_info"
 
 if [ -n "$eta_info" ]; then
     read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-    assert_eq "spiky 10h: pre+post reset consumption" "12.5" "$rate"
+    assert_range "spiky 10h: 50% consumption / 10h window" "4.9" "5.1" "$rate"
 fi
 
 echo ""
-echo "=== Noisy Data: Net Change Immune to Micro-Fluctuations ==="
+echo "=== Noisy Data: Sum of Positive Deltas ==="
 
-# Simulate API jitter: value goes 10, 12, 11, 14, 13, 16, 15, 18 over 7 hours
-# Net change = 8% over 7h = 1.14%/h, but sum-of-positive-deltas = 2+3+3+3 = 14%
+# Each downward bounce is treated as a reset boundary, so positive deltas sum.
+# Values: 10, 12, 11, 14, 13, 16, 15, 18 over 7 hours.
+# Positive deltas: +2, -1(skip), +3, -1(skip), +3, -1(skip), +3 = 11.
+# Window=10h → rate = 11/10 = 1.1 %/h
 > "$CU_HISTORY_LONG"
 local_base=1700000000
 noisy_vals=(10 12 11 14 13 16 15 18)
@@ -192,14 +197,12 @@ for i in "${!noisy_vals[@]}"; do
 done
 export CU_NOW=$((local_base + 7 * 3600))
 
-# Use window=10h so 7h of data gives 70% coverage (well above minimum)
 eta_info=$(cu_eta_projection "seven_day" 10 "long" 2>/dev/null)
 assert_nonzero "noisy data produces output" "$eta_info"
 
 if [ -n "$eta_info" ]; then
     read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-    # Net: (18-10)/7h = 1.14%/h — must NOT be inflated by the fluctuations
-    assert_range "noisy data rate reflects net change, not positive-delta sum" "1.0" "1.2" "$rate"
+    assert_range "noisy data: sum of positive deltas / wall-clock window" "1.0" "1.2" "$rate"
 fi
 
 echo ""
@@ -215,32 +218,36 @@ for i in 0 1 2 3 4; do
 done
 export CU_NOW=$((local_base + 4 * 3600))
 
-# Window=1h: last hour 20→25 = 5.0%/h
+# Window=1h: anchor at hour 3 (val=20). Last delta: +5. rate = 5/1 = 5.0%/h
 eta_info=$(cu_eta_projection "seven_day" 1 "long" 2>/dev/null)
 assert_nonzero "window=1 produces output" "$eta_info"
 
 if [ -n "$eta_info" ]; then
     read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-    assert_eq "window=1 rate = 5.0" "5.0" "$rate"
+    assert_range "window=1 rate = 5.0" "4.9" "5.1" "$rate"
 fi
 
 echo ""
-echo "=== ETA with Insufficient Data ==="
+echo "=== Zero Rate When No Real Data ==="
 
-# Empty long history
+# Empty long history → rate=0, no projection
 > "$CU_HISTORY_LONG"
 eta_info=$(cu_eta_projection "seven_day" 24 "long" 2>/dev/null || true)
-assert_eq "no eta with empty history" "" "$eta_info"
+read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+assert_eq "empty history → rate=0" "0" "${rate%.*}"
+assert_eq "empty history → secs=0" "0" "${eta_secs:-}"
 
-# Single entry
+# Single entry → no deltas to sum → rate=0
 echo '{"ts":1709100000,"seven_day":{"util":30,"resets_at":""}}' > "$CU_HISTORY_LONG"
 eta_info=$(cu_eta_projection "seven_day" 24 "long" 2>/dev/null || true)
-assert_eq "no eta with single entry" "" "$eta_info"
+read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+assert_eq "single entry → rate=0" "0" "${rate%.*}"
 
 echo ""
 echo "=== Only Negative Deltas (Decreasing Usage) ==="
 
-# Usage going down: 50, 40, 30
+# Usage going down: 50, 40, 30. Every delta is negative — treated as resets.
+# No positive deltas → rate=0.
 > "$CU_HISTORY_LONG"
 local_base=1700000000
 for i in 0 1 2; do
@@ -251,7 +258,9 @@ done
 export CU_NOW=$((local_base + 2 * 3600))
 
 eta_info=$(cu_eta_projection "seven_day" 24 "long" 2>/dev/null || true)
-assert_eq "no eta with only negative deltas" "" "$eta_info"
+read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+assert_eq "only-negative-deltas → rate=0" "0" "${rate%.*}"
+assert_eq "only-negative-deltas → secs=0" "0" "${eta_secs:-}"
 
 echo ""
 echo "=== Gap Handling: Weekend Gap (Real-World Scenario) ==="
@@ -313,8 +322,8 @@ assert_nonzero "both-sides-of-reset produces output" "$eta_info"
 
 if [ -n "$eta_info" ]; then
     read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-    # Pre-reset: 100-80=20%. Post-reset: 16-0=16%. Total=36% over 24h = 1.5%/h
-    assert_eq "both sides: 20% pre + 16% post = 36%/24h" "1.5" "$rate"
+    # Positive deltas: +10, +10, -100(skip), +8, +8 = 36% over 24h = 1.5%/h
+    assert_range "both sides: 20% pre + 16% post = 36%/24h" "1.49" "1.51" "$rate"
 fi
 
 echo ""
@@ -364,18 +373,20 @@ for i in 0 1 2 3 4; do
 done
 export CU_NOW=$((local_base + 4 * 1800))
 
-# 2h of data for a 24h window = 8.3% coverage — below 25% minimum
+# 2h of data for a 24h window: positive deltas +2+2+2+2 = 8 / 24h = 0.33%/h.
+# No coverage check anymore — we trust wall-clock as denominator and accept
+# that sparse history simply yields a low rate.
 eta_info=$(cu_eta_projection "seven_day" 24 "long" 2>/dev/null || true)
-assert_eq "tiny data span for large window rejected" "" "$eta_info"
+read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+assert_range "tiny data span: 8% / 24h ≈ 0.33%/h" "0.3" "0.4" "$rate"
 
-# Same data but with window=4h: 2h/4h = 50% coverage — should work
+# Same data but with window=4h: 8% / 4h = 2.0%/h
 eta_info=$(cu_eta_projection "seven_day" 4 "long" 2>/dev/null)
 assert_nonzero "adequate coverage produces output" "$eta_info"
 
 if [ -n "$eta_info" ]; then
     read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
-    # 20→28 over 2h = 4.0%/h
-    assert_eq "small window rate correct" "4.0" "$rate"
+    assert_range "small window rate = 2.0%/h" "1.99" "2.01" "$rate"
 fi
 
 echo ""
@@ -422,9 +433,10 @@ assert_nonzero "five_hour defaults to short tier" "$eta_info"
 eta_info=$(cu_eta_projection "seven_day" 10 2>/dev/null)
 assert_nonzero "seven_day defaults to short tier" "$eta_info"
 
-# Cross-check: five_hour from long tier should fail (no data)
+# Cross-check: five_hour from long tier has no data → rate=0
 eta_info=$(cu_eta_projection "five_hour" 10 "long" 2>/dev/null || true)
-assert_eq "five_hour from long tier has no data" "" "$eta_info"
+read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+assert_eq "five_hour from long tier → rate=0" "0" "${rate%.*}"
 
 echo ""
 echo "=== Short-to-Long Tier Fallback ==="
