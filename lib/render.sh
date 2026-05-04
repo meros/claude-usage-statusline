@@ -442,6 +442,7 @@ cu_debug_template_seven_day() {
 
     printf '%s\n' "$tsv" | awk -F'\t' '
         BEGIN {
+            n = 0
             for (i = 0; i < 168; i++) { sum[i]=0; cnt[i]=0 }
             days[0]="Sun"; days[1]="Mon"; days[2]="Tue"; days[3]="Wed"
             days[4]="Thu"; days[5]="Fri"; days[6]="Sat"
@@ -478,6 +479,7 @@ cu_debug_template_seven_day() {
         -v current_util="$current_util" \
         -v secs_to_reset="$secs_to_reset" '
         BEGIN {
+            n = 0
             for (i = 0; i < 168; i++) { sum[i]=0; cnt[i]=0 }
             days[0]="Sun"; days[1]="Mon"; days[2]="Tue"; days[3]="Wed"
             days[4]="Thu"; days[5]="Fri"; days[6]="Sat"
