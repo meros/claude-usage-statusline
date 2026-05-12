@@ -351,6 +351,9 @@ _statusline_single() {
     # Staleness warning
     [ "$_cache_stale" = "1" ] && printf " %s" "$(_stale_detail)"
 
+    # Optional pacing segment (renders nothing when contract file is absent/stale)
+    declare -F cu_pace_render_inline >/dev/null && cu_pace_render_inline
+
     # Update notification (appended at end of line)
     local update_msg
     update_msg=$(cu_update_message)
@@ -483,6 +486,9 @@ _statusline_multiline() {
 
     # Staleness warning
     [ "$_cache_stale" = "1" ] && printf " %s" "$(_stale_detail)"
+
+    # Optional pacing row (renders nothing when contract file is absent/stale)
+    declare -F cu_pace_render_multiline >/dev/null && cu_pace_render_multiline
 
     # Update notification on its own line
     local update_msg

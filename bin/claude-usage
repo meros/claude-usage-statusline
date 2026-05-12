@@ -43,6 +43,8 @@ source "${LIB_DIR}/history.sh"
 source "${LIB_DIR}/render.sh"
 # shellcheck source=../lib/update.sh
 source "${LIB_DIR}/update.sh"
+# shellcheck source=../lib/pace.sh
+[ -r "${LIB_DIR}/pace.sh" ] && source "${LIB_DIR}/pace.sh"
 
 # Parse global flags
 CU_OPT_NO_COLOR=""
