@@ -14,15 +14,36 @@ cu_view_statusline() {
     input=$(cat)
     cu_log "statusline: stdin ${#input} bytes"
 
-    local cwd cwd_basename git_branch
+    local cwd cwd_basename git_branch task_desc
     cwd=$(echo "$input" | jq -r '.workspace.current_dir // empty' 2>/dev/null)
     cwd_basename=$(basename "${cwd:-.}")
     git_branch=$(cd "$cwd" 2>/dev/null && git branch --show-current 2>/dev/null || true)
-    cu_log "statusline: cwd=$cwd branch=$git_branch"
 
-    # Fetch + record history (only record when we got fresh data)
+    # Read per-instance task description from claude-tasks state
+    task_desc=""
+    if [ -n "$cwd" ]; then
+        local cwd_key
+        cwd_key=$(echo "$cwd" | tr '/' '-')
+        local task_file="$HOME/.local/state/claude-tasks/$cwd_key"
+        if [ -f "$task_file" ]; then
+            task_desc=$(head -1 "$task_file" 2>/dev/null || true)
+        fi
+    fi
+    cu_log "statusline: cwd=$cwd branch=$git_branch task=$task_desc"
+
+    # Prefer rate_limits piped by Claude Code v2.1.80+ — the /api/oauth/usage
+    # endpoint is aggressively rate-limited and unrecoverable once tripped
+    # (anthropics/claude-code#31637). Fall through to the API path only when
+    # stdin has no rate_limits (older CC, or first render before any response).
     local _fetch_ok=""
-    if [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
+    local _piped_data
+    _piped_data=$(cu_extract_piped_usage "$input" 2>/dev/null || true)
+    if [ -n "$_piped_data" ]; then
+        cu_log "statusline: using rate_limits from stdin"
+        cu_write_cache "$_piped_data"
+        cu_history_record "$_piped_data"
+        _fetch_ok=1
+    elif [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
         if cu_fetch; then
             _fetch_ok=1
             local cache_data
@@ -262,12 +283,15 @@ _window_config() {
 _statusline_single() {
     local modules="${CU_MODULES:-${_CU_DEFAULT_MODULES_SINGLE}}"
 
-    # Build directory + git branch section
+    # Build directory + git branch + task section
     local dir_section
     if [ -n "$git_branch" ]; then
         dir_section="$(cu_color "${CU_COLOR_DIR}")${cwd_basename}$(cu_reset) $(cu_color "${CU_COLOR_BRANCH}") ${git_branch}$(cu_reset)"
     else
         dir_section="$(cu_color "${CU_COLOR_DIR}")${cwd_basename}$(cu_reset)"
+    fi
+    if [ -n "$task_desc" ]; then
+        dir_section+=" $(cu_color "${CU_COLOR_LABEL}")· ${task_desc}$(cu_reset)"
     fi
 
     # Build usage section
@@ -339,13 +363,16 @@ _statusline_single() {
 _statusline_multiline() {
     local modules="${CU_MODULES:-${_CU_DEFAULT_MODULES_MULTI}}"
 
-    # Line 1: directory + branch
+    # Line 1: directory + branch + task
     if [ -n "$git_branch" ]; then
         printf "%s%s%s %s %s%s" \
             "$(cu_color "${CU_COLOR_DIR}")" "$cwd_basename" "$(cu_reset)" \
             "$(cu_color "${CU_COLOR_BRANCH}")" "$git_branch" "$(cu_reset)"
     else
         printf "%s%s%s" "$(cu_color "${CU_COLOR_DIR}")" "$cwd_basename" "$(cu_reset)"
+    fi
+    if [ -n "$task_desc" ]; then
+        printf " %s· %s%s" "$(cu_color "${CU_COLOR_LABEL}")" "$task_desc" "$(cu_reset)"
     fi
 
     if [ -z "$data" ]; then return 0; fi

@@ -188,6 +188,41 @@ cu_read_cache() {
     [ -f "$CU_CACHE_FILE" ] && cat "$CU_CACHE_FILE" || true
 }
 
+# Translate Claude Code v2.1.80+ stdin rate_limits into our cache schema.
+# Avoids /api/oauth/usage which is aggressively rate-limited (anthropics/claude-code#31637).
+# Input  (CC stdin):   {"rate_limits": {"five_hour": {"used_percentage": N, "resets_at": <unix>}, "seven_day": {...}}}
+# Output (cache):      {"five_hour": {"utilization": N, "resets_at": "<iso>"}, "seven_day": {...}}
+# Returns 1 with no output when rate_limits is absent or empty.
+cu_extract_piped_usage() {
+    local input="${1:-}"
+    [ -z "$input" ] && return 1
+    echo "$input" | jq -e '.rate_limits | (.five_hour // .seven_day)' >/dev/null 2>&1 || return 1
+    echo "$input" | jq -c '
+        def to_iso:
+            if . == null then null
+            elif type == "number" then (if . == 0 then null else todate end)
+            elif type == "string" then .
+            else null end;
+        def window:
+            if . == null then null
+            else {utilization: .used_percentage, resets_at: (.resets_at | to_iso)} end;
+        {
+            five_hour: (.rate_limits.five_hour | window),
+            seven_day: (.rate_limits.seven_day | window)
+        }
+    '
+}
+
+# Atomic cache write. Clears any rate-limit backoff since we now have fresh data.
+cu_write_cache() {
+    local payload="${1:-}"
+    [ -z "$payload" ] && return 1
+    mkdir -p "$CU_CACHE_DIR"
+    local tmp="${CU_CACHE_FILE}.tmp.$$"
+    printf '%s\n' "$payload" > "$tmp" && mv "$tmp" "$CU_CACHE_FILE"
+    rm -f "$CU_BACKOFF_FILE"
+}
+
 cu_get_five_hour_pct() {
     local data="${1:-$(cu_read_cache)}"
     echo "$data" | jq -r '.five_hour.utilization // empty' 2>/dev/null

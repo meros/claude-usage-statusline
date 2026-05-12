@@ -174,5 +174,36 @@ PATH="$CLEAN_PATH" cu_resolve_token >/dev/null && result=0 || result=$?
 assert_eq "no security command and no creds file returns failure" "1" "$result"
 
 echo ""
+echo "=== cu_extract_piped_usage Tests (CC v2.1.80+ stdin path) ==="
+
+out=$(cu_extract_piped_usage '{"rate_limits":{"five_hour":{"used_percentage":42,"resets_at":1778580000},"seven_day":{"used_percentage":19,"resets_at":1779100000}}}')
+assert_eq "translates five_hour pct" "42" "$(echo "$out" | jq -r '.five_hour.utilization')"
+assert_eq "translates seven_day pct" "19" "$(echo "$out" | jq -r '.seven_day.utilization')"
+assert_eq "unix epoch -> iso resets_at" "2026-05-12T10:00:00Z" "$(echo "$out" | jq -r '.five_hour.resets_at')"
+
+out=$(cu_extract_piped_usage '{"rate_limits":{"five_hour":{"used_percentage":0,"resets_at":null}}}')
+assert_eq "null resets_at stays null" "null" "$(echo "$out" | jq -r '.five_hour.resets_at')"
+assert_eq "absent seven_day -> null" "null" "$(echo "$out" | jq -r '.seven_day')"
+
+cu_extract_piped_usage '{"workspace":{"current_dir":"/tmp"}}' >/dev/null && result=0 || result=$?
+assert_eq "no rate_limits returns failure" "1" "$result"
+
+cu_extract_piped_usage '' >/dev/null && result=0 || result=$?
+assert_eq "empty input returns failure" "1" "$result"
+
+echo ""
+echo "=== cu_write_cache Tests ==="
+export CU_CACHE_DIR="$TEST_DIR/write-cache"
+CU_CACHE_FILE="${CU_CACHE_DIR}/api-response.json"
+CU_BACKOFF_FILE="${CU_CACHE_DIR}/rate-limit-backoff"
+mkdir -p "$CU_CACHE_DIR"
+echo 1800 > "$CU_BACKOFF_FILE"
+
+cu_write_cache '{"five_hour":{"utilization":7}}'
+assert_eq "writes payload to cache file" "7" "$(jq -r '.five_hour.utilization' "$CU_CACHE_FILE")"
+[ -f "$CU_BACKOFF_FILE" ] && result=present || result=absent
+assert_eq "clears backoff file" "absent" "$result"
+
+echo ""
 printf "Results: %d passed, %d failed\n" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
