@@ -132,3 +132,18 @@ cu_round() {
     local val="$1"
     printf "%.0f" "$val" 2>/dev/null || echo "${val%.*}"
 }
+
+# Check if Anthropic rate limits should be hidden:
+# 1) Explicitly disabled via CU_NO_LIMITS=1 or CU_HIDE_LIMITS=1
+# 2) Non-Anthropic custom API endpoint (e.g. LiteLLM, OpenRouter) via ANTHROPIC_BASE_URL
+cu_limits_disabled() {
+    [ "${CU_NO_LIMITS:-}" = "1" ] && return 0
+    [ "${CU_HIDE_LIMITS:-}" = "1" ] && return 0
+    if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
+        case "$ANTHROPIC_BASE_URL" in
+            https://api.anthropic.com*|http://api.anthropic.com*) return 1 ;;
+            *) return 0 ;;
+        esac
+    fi
+    return 1
+}

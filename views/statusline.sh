@@ -14,68 +14,86 @@ cu_view_statusline() {
     input=$(cat)
     cu_log "statusline: stdin ${#input} bytes"
 
-    local cwd cwd_basename git_branch task_desc
+    local cwd cwd_basename git_branch task_desc task_progress
     cwd=$(echo "$input" | jq -r '.workspace.current_dir // empty' 2>/dev/null)
     cwd_basename=$(basename "${cwd:-.}")
     git_branch=$(cd "$cwd" 2>/dev/null && git branch --show-current 2>/dev/null || true)
 
-    # Read per-instance task description from claude-tasks state
+    # Read per-instance task description from claude-tasks state.
+    # task-name-update.sh keys the file by the Claude process PID (pid-$CLAUDE_PID),
+    # found by walking up the parent chain to the first claude comm. The statusline
+    # is spawned by Claude, so the same walk from our own PID resolves the same PID.
     task_desc=""
-    if [ -n "$cwd" ]; then
-        local cwd_key
-        cwd_key=$(echo "$cwd" | tr '/' '-')
-        local task_file="$HOME/.local/state/claude-tasks/$cwd_key"
-        if [ -f "$task_file" ]; then
-            task_desc=$(head -1 "$task_file" 2>/dev/null || true)
-        fi
+    task_progress=""
+    local _tpid=$$ _claude_pid=""
+    while [ "$_tpid" -gt 1 ] 2>/dev/null; do
+        local _comm
+        _comm=$(cat /proc/"$_tpid"/comm 2>/dev/null) || break
+        case "$_comm" in
+            .claude-unwrapp*|claude) _claude_pid=$_tpid; break ;;
+        esac
+        _tpid=$(awk '{print $4}' /proc/"$_tpid"/stat 2>/dev/null) || break
+    done
+    if [ -n "$_claude_pid" ]; then
+        local _state_dir="$HOME/.local/state/claude-tasks"
+        [ -f "$_state_dir/pid-$_claude_pid" ] && task_desc=$(head -1 "$_state_dir/pid-$_claude_pid" 2>/dev/null || true)
+        # claude-task.sh renders the progress with its ETA counted down to now
+        # ("2/5 check + review · 12m left"); the raw file is the fallback.
+        task_progress=$("$HOME/.claude/hooks/claude-task.sh" summary 2>/dev/null) ||
+            { [ -f "$_state_dir/progress-$_claude_pid" ] && task_progress=$(head -1 "$_state_dir/progress-$_claude_pid" 2>/dev/null || true); }
     fi
-    cu_log "statusline: cwd=$cwd branch=$git_branch task=$task_desc"
+    cu_log "statusline: cwd=$cwd branch=$git_branch task=$task_desc progress=$task_progress"
 
     # Prefer rate_limits piped by Claude Code v2.1.80+ — the /api/oauth/usage
     # endpoint is aggressively rate-limited and unrecoverable once tripped
     # (anthropics/claude-code#31637). Fall through to the API path only when
     # stdin has no rate_limits (older CC, or first render before any response).
     local _fetch_ok=""
-    local _piped_data
-    _piped_data=$(cu_extract_piped_usage "$input" 2>/dev/null || true)
-    if [ -n "$_piped_data" ]; then
-        cu_log "statusline: using rate_limits from stdin"
-        cu_write_cache "$_piped_data"
-        cu_history_record "$_piped_data"
-        _fetch_ok=1
-    elif [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
-        if cu_fetch; then
-            _fetch_ok=1
-            local cache_data
-            cache_data=$(cu_read_cache)
-            [ -n "$cache_data" ] && cu_history_record "$cache_data"
-        else
-            cu_log "statusline: fetch failed, using cached data"
-        fi
-    fi
-
-    local data
-    data=$(cu_read_cache)
-
-    # Check staleness: data age > 2x cache TTL means we've failed to refresh
+    local data=""
     local _cache_stale=""
-    if [ -z "$_fetch_ok" ] && [ -f "$CU_CACHE_FILE" ]; then
-        local age
-        age=$(cu_cache_age)
-        [ "$age" -gt $((CU_CACHE_MAX_AGE * 2)) ] && _cache_stale=1
-    fi
-
-    # Parse usage data once
     local five_pct="" seven_pct="" five_reset="" seven_reset="" cache_error=""
-    if [ -n "$data" ]; then
-        cache_error=$(echo "$data" | jq -r '._error // empty' 2>/dev/null)
-        five_pct=$(cu_get_five_hour_pct "$data")
-        seven_pct=$(cu_get_seven_day_pct "$data")
-        five_reset=$(cu_get_five_hour_reset "$data")
-        seven_reset=$(cu_get_seven_day_reset "$data")
-        cu_log "statusline: five_pct=$five_pct seven_pct=$seven_pct"
+
+    if ! cu_limits_disabled; then
+        local _piped_data
+        _piped_data=$(cu_extract_piped_usage "$input" 2>/dev/null || true)
+        if [ -n "$_piped_data" ]; then
+            cu_log "statusline: using rate_limits from stdin"
+            cu_write_cache "$_piped_data"
+            cu_history_record "$_piped_data"
+            _fetch_ok=1
+        elif [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
+            if cu_fetch; then
+                _fetch_ok=1
+                local cache_data
+                cache_data=$(cu_read_cache)
+                [ -n "$cache_data" ] && cu_history_record "$cache_data"
+            else
+                cu_log "statusline: fetch failed, using cached data"
+            fi
+        fi
+
+        data=$(cu_read_cache)
+
+        # Check staleness: data age > 2x cache TTL means we've failed to refresh
+        if [ -z "$_fetch_ok" ] && [ -f "$CU_CACHE_FILE" ]; then
+            local age
+            age=$(cu_cache_age)
+            [ "$age" -gt $((CU_CACHE_MAX_AGE * 2)) ] && _cache_stale=1
+        fi
+
+        # Parse usage data once
+        if [ -n "$data" ]; then
+            cache_error=$(echo "$data" | jq -r '._error // empty' 2>/dev/null)
+            five_pct=$(cu_get_five_hour_pct "$data")
+            seven_pct=$(cu_get_seven_day_pct "$data")
+            five_reset=$(cu_get_five_hour_reset "$data")
+            seven_reset=$(cu_get_seven_day_reset "$data")
+            cu_log "statusline: five_pct=$five_pct seven_pct=$seven_pct"
+        else
+            cu_log "statusline: no cached data available"
+        fi
     else
-        cu_log "statusline: no cached data available"
+        cu_log "statusline: usage limits disabled (custom endpoint or CU_NO_LIMITS)"
     fi
 
     # Trigger background update check
@@ -293,6 +311,9 @@ _statusline_single() {
     if [ -n "$task_desc" ]; then
         dir_section+=" $(cu_color "${CU_COLOR_LABEL}")· ${task_desc}$(cu_reset)"
     fi
+    if [ -n "$task_progress" ]; then
+        dir_section+=" $(cu_color "$CU_DIM")(${task_progress})$(cu_reset)"
+    fi
 
     # Build usage section
     local usage_section=""
@@ -352,7 +373,7 @@ _statusline_single() {
     [ "$_cache_stale" = "1" ] && printf " %s" "$(_stale_detail)"
 
     # Optional pacing segment (renders nothing when contract file is absent/stale)
-    declare -F cu_pace_render_inline >/dev/null && cu_pace_render_inline
+    declare -F cu_pace_render_inline >/dev/null && cu_pace_render_inline "$seven_pct" "$seven_reset"
 
     # Update notification (appended at end of line)
     local update_msg
@@ -376,6 +397,9 @@ _statusline_multiline() {
     fi
     if [ -n "$task_desc" ]; then
         printf " %s· %s%s" "$(cu_color "${CU_COLOR_LABEL}")" "$task_desc" "$(cu_reset)"
+    fi
+    if [ -n "$task_progress" ]; then
+        printf " %s(%s)%s" "$(cu_color "$CU_DIM")" "$task_progress" "$(cu_reset)"
     fi
 
     if [ -z "$data" ]; then return 0; fi
@@ -488,7 +512,7 @@ _statusline_multiline() {
     [ "$_cache_stale" = "1" ] && printf " %s" "$(_stale_detail)"
 
     # Optional pacing row (renders nothing when contract file is absent/stale)
-    declare -F cu_pace_render_multiline >/dev/null && cu_pace_render_multiline
+    declare -F cu_pace_render_multiline >/dev/null && cu_pace_render_multiline "$seven_pct" "$seven_reset"
 
     # Update notification on its own line
     local update_msg

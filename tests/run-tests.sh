@@ -26,6 +26,7 @@ run_suite "Render Tests" "${SCRIPT_DIR}/test-render.sh"
 run_suite "History Tests" "${SCRIPT_DIR}/test-history.sh"
 run_suite "ETA Tests" "${SCRIPT_DIR}/test-eta.sh"
 run_suite "Fetch Tests" "${SCRIPT_DIR}/test-fetch.sh"
+run_suite "Pacing Tests" "${SCRIPT_DIR}/test-pace.sh"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
