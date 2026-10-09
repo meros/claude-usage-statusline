@@ -73,11 +73,8 @@ _cu_statusline_load_usage() {
     if [ -z "$fetched" ] && [ "$(cu_cache_age)" -gt $((CU_CACHE_MAX_AGE * 2)) ]; then
         _cache_stale=1
     fi
-    cache_error=$(echo "$data" | jq -r '._error // empty' 2>/dev/null)
-    five_pct=$(cu_get_five_hour_pct "$data")
-    seven_pct=$(cu_get_seven_day_pct "$data")
-    five_reset=$(cu_get_five_hour_reset "$data")
-    seven_reset=$(cu_get_seven_day_reset "$data")
+    IFS=$'\x1f' read -r cache_error five_pct five_reset seven_pct seven_reset \
+        <<< "$(cu_usage_fields "$data")" || true
     cu_log "statusline: five_pct=$five_pct seven_pct=$seven_pct"
 }
 

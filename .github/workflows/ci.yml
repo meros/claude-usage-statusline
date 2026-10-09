@@ -14,6 +14,8 @@ jobs:
         run: |
           shellcheck -x bin/claude-usage install.sh scripts/*.sh tests/*.sh tests/lib/*.sh
           shellcheck -x -e SC2034,SC2154 lib/*.sh views/*.sh
+      - name: Install strace (process budget test)
+        run: sudo apt-get install -y strace
       - name: Tests
         run: bash tests/run-tests.sh
 

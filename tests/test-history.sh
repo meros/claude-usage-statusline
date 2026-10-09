@@ -95,6 +95,32 @@ assert_nonzero "short tier had entries to prune" "$((short_before - short_after)
 assert_nonzero "long tier had entries to prune" "$((long_before - long_after))"
 
 echo ""
+echo "=== Automatic Prune On Record ==="
+
+# Recording prunes once per hour, so the short tier stays at 36 hours even
+# when nothing runs `claude-usage fetch`.
+rm -f "$CU_HISTORY_SHORT" "$CU_HISTORY_LONG" "$CU_DATA_DIR/.last-prune"
+export CU_NOW=1709200000
+echo '{"ts":1709000000,"five_hour":{"util":1,"resets_at":""}}' > "$CU_HISTORY_SHORT"
+cu_history_record '{"five_hour":{"utilization":5,"resets_at":""}}'
+assert_eq "first record prunes the old entry" "1" "$(wc -l < "$CU_HISTORY_SHORT" | tr -d ' ')"
+assert_eq "prune time saved" "1709200000" "$(cat "$CU_DATA_DIR/.last-prune")"
+
+sed -i '1i {"ts":1709000000,"five_hour":{"util":1,"resets_at":""}}' "$CU_HISTORY_SHORT"
+export CU_NOW=1709200600
+cu_history_record '{"five_hour":{"utilization":6,"resets_at":""}}'
+assert_eq "no prune within the hour" "3" "$(wc -l < "$CU_HISTORY_SHORT" | tr -d ' ')"
+
+export CU_NOW=1709203600
+cu_history_record '{"five_hour":{"utilization":7,"resets_at":""}}'
+assert_eq "prunes again after an hour" "3" "$(wc -l < "$CU_HISTORY_SHORT" | tr -d ' ')"
+assert_eq "old entry gone" "0" "$(grep -c 1709000000 "$CU_HISTORY_SHORT" || true)"
+
+echo garbage > "$CU_DATA_DIR/.last-prune"
+cu_history_record '{"five_hour":{"utilization":8,"resets_at":""}}'
+assert_eq "bad marker counts as never pruned" "1709203600" "$(cat "$CU_DATA_DIR/.last-prune")"
+
+echo ""
 echo "=== Missing Fields Don't Create Wrong Tier Entries ==="
 
 # Reset files

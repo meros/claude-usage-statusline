@@ -200,10 +200,9 @@ cu_write_cache() {
 # Output (cache):      {"five_hour": {"utilization": N, "resets_at": "<iso>"}, "seven_day": {...}}
 # Returns 1 with no output when rate_limits is absent or empty.
 cu_extract_piped_usage() {
-    local input="${1:-}"
+    local input="${1:-}" out
     [ -z "$input" ] && return 1
-    echo "$input" | jq -e '.rate_limits | (.five_hour // .seven_day)' >/dev/null 2>&1 || return 1
-    echo "$input" | jq -c '
+    out=$(echo "$input" | jq -c '
         def to_iso:
             if . == null then null
             elif type == "number" then (if . == 0 then null else todate end)
@@ -212,11 +211,13 @@ cu_extract_piped_usage() {
         def window:
             if . == null then null
             else {utilization: .used_percentage, resets_at: (.resets_at | to_iso)} end;
-        {
+        if (.rate_limits | (.five_hour // .seven_day)) then {
             five_hour: (.rate_limits.five_hour | window),
             seven_day: (.rate_limits.seven_day | window)
-        }
-    '
+        } else empty end
+    ' 2>/dev/null)
+    [ -n "$out" ] || return 1
+    echo "$out"
 }
 
 # Fields of a cache payload (default: the cache file).
@@ -224,6 +225,20 @@ cu_extract_piped_usage() {
 cu_usage_field() {
     local window="$1" key="$2" data="${3:-$(cu_read_cache)}"
     echo "$data" | jq -r --arg w "$window" --arg k "$key" '.[$w][$k] // empty' 2>/dev/null
+}
+
+# All fields the statusline needs, in one jq call, separated by \x1f:
+#   error, five_hour pct, five_hour reset, seven_day pct, seven_day reset
+# Resets come out as epochs (no `date` per use); an unparseable time stays as is.
+cu_usage_fields() {
+    local data="${1:-$(cu_read_cache)}"
+    echo "$data" | jq -r '
+        def epoch: if . == null or . == "" then ""
+            else (try (sub("\\.[0-9]+"; "") | sub("[+]00:00$"; "Z") | fromdateiso8601) catch .) end;
+        [(._error // ""),
+         (.five_hour.utilization // ""), (.five_hour.resets_at | epoch),
+         (.seven_day.utilization // ""), (.seven_day.resets_at | epoch)]
+        | map(tostring) | join("\u001f")' 2>/dev/null
 }
 
 cu_get_five_hour_pct()   { cu_usage_field five_hour utilization "${1:-}"; }

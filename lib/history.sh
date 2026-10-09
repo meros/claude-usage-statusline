@@ -24,15 +24,30 @@ cu_history_file() {
 }
 
 # Append LINE to FILE unless the last record falls in the same INTERVAL bucket.
+# Records start with {"ts":N, so the last timestamp needs no jq.
 _cu_history_append() {
     local file="$1" interval="$2" now="$3" line="$4"
-    [ -n "$line" ] || return 0
+    [ -n "$line" ] && [ "$line" != "null" ] || return 0
     if [ -f "$file" ]; then
-        local last_ts
-        last_ts=$(tail -1 "$file" 2>/dev/null | tr -d '\0' | jq -r '.ts // 0' 2>/dev/null)
-        [ $(( now / interval )) = $(( ${last_ts:-0} / interval )) ] && return 0
+        local last last_ts=0
+        last=$(tail -1 "$file" 2>/dev/null | tr -d '\0')
+        [[ "$last" =~ ^\{\"ts\":([0-9]+) ]] && last_ts="${BASH_REMATCH[1]}"
+        [ $(( now / interval )) = $(( last_ts / interval )) ] && return 0
     fi
     echo "$line" >> "$file"
+}
+
+# Prune at most once per CU_PRUNE_INTERVAL seconds. The statusline records on
+# every render, so without this the short tier grows without limit. The
+# marker holds an epoch (not its mtime), so CU_NOW works in tests.
+CU_PRUNE_INTERVAL=3600
+_cu_history_maybe_prune() {
+    local marker="${CU_DATA_DIR}/.last-prune" now="$1" last=0
+    [ -f "$marker" ] && read -r last < "$marker" 2>/dev/null
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    [ $(( now - last )) -ge "$CU_PRUNE_INTERVAL" ] || return 0
+    cu_history_prune
+    echo "$now" > "$marker"
 }
 
 # Record a cache payload (default: the cache file) into both tiers.
@@ -46,22 +61,22 @@ cu_history_record() {
         _CU_MIGRATED=1
     fi
 
-    local now short_line long_line
+    local now lines short_line="" long_line=""
     now=$(cu_now)
-    short_line=$(echo "$data" | jq -c --argjson ts "$now" '
+    # Line 1: short-tier record, line 2: long-tier record ("null" = none)
+    lines=$(echo "$data" | jq -c --argjson ts "$now" '
         def rec: {util: .utilization, resets_at: (.resets_at // "")};
-        if (.five_hour or .seven_day) then
+        (if (.five_hour or .seven_day) then
             {ts: $ts}
             + (if .five_hour then {five_hour: (.five_hour | rec)} else {} end)
             + (if .seven_day then {seven_day: (.seven_day | rec)} else {} end)
-        else empty end' 2>/dev/null) || true
-    long_line=$(echo "$data" | jq -c --argjson ts "$now" '
-        if .seven_day then
-            {ts: $ts, seven_day: {util: .seven_day.utilization, resets_at: (.seven_day.resets_at // "")}}
-        else empty end' 2>/dev/null) || true
+        else null end),
+        (if .seven_day then {ts: $ts, seven_day: (.seven_day | rec)} else null end)' 2>/dev/null) || true
+    { read -r short_line; read -r long_line; } <<< "$lines" || true
 
     _cu_history_append "$CU_HISTORY_SHORT" "$CU_SHORT_INTERVAL" "$now" "$short_line"
     _cu_history_append "$CU_HISTORY_LONG" "$CU_LONG_INTERVAL" "$now" "$long_line"
+    _cu_history_maybe_prune "$now"
 }
 
 # Refresh the cache (unless --no-fetch) and record it into history.

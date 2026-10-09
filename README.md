@@ -177,8 +177,9 @@ Every render records a snapshot in two JSONL files:
 | short | 5 minutes | 36 hours | 5h and 7d | burn rate, 5h sparkline |
 | long | 1 hour | 1 year | 7d | 7d sparkline, seasonal projection |
 
-History builds up as you use Claude Code; the rate and projections improve
-after the first hours and days.
+Records older than the retention are pruned at most once an hour, during a
+normal render. History builds up as you use Claude Code; the rate and
+projections improve after the first hours and days.
 
 ### Projections
 
@@ -351,6 +352,10 @@ nix flake check                    # tests + shellcheck in the Nix sandbox
 ```bash
 UPDATE_SNAPSHOTS=1 bash tests/test-snapshots.sh && git diff tests/snapshots
 ```
+
+`tests/test-budget.sh` counts the processes one statusline render starts
+(with `strace`; skipped without it) and fails above a budget. Claude Code runs
+the statusline after every message, and process starts are most of its cost.
 
 `bash scripts/screenshots.sh` renders `docs/*.png` from the same dataset (needs
 Nix for the font and Chrome or Chromium).

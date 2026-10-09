@@ -37,9 +37,12 @@ cu_log() {
 # --- Clock ---------------------------------------------------------------
 
 # Current epoch. CU_NOW overrides it for deterministic tests.
+# Bash 5 has $EPOCHSECONDS, which needs no `date` process.
 cu_now() {
     if [ -n "${CU_NOW:-}" ]; then
         echo "$CU_NOW"
+    elif [ -n "${EPOCHSECONDS:-}" ]; then
+        echo "$EPOCHSECONDS"
     else
         date +%s
     fi
@@ -56,14 +59,19 @@ cu_file_age() {
 }
 
 # ISO 8601 timestamp to epoch (GNU date, then BSD date). Empty on failure.
+# An epoch passes through unchanged, so callers can convert once up front.
 cu_iso_to_epoch() {
     local iso="$1"
     [ -z "$iso" ] && return 1
+    if [[ "$iso" =~ ^[0-9]+$ ]]; then
+        echo "$iso"
+        return 0
+    fi
     date -d "$iso" +%s 2>/dev/null ||
         date -j -u -f "%Y-%m-%dT%H:%M:%S" "${iso%%[.Z+]*}" +%s 2>/dev/null
 }
 
-# Seconds from now until an ISO 8601 timestamp (negative when it is past).
+# Seconds from now until an ISO 8601 timestamp or epoch (negative when past).
 cu_secs_until_reset() {
     local iso="$1" reset_epoch
     [ -z "$iso" ] && { echo 0; return; }
@@ -138,7 +146,7 @@ cu_fmt_day_hour() {
         LC_TIME=C date -r "$1" "+%a %-l%p" 2>/dev/null | tr 'AP' 'ap'
 }
 
-# ISO 8601 reset time as "Fri 9am".
+# Reset time (ISO 8601 or epoch) as "Fri 9am".
 cu_fmt_reset_date() {
     local epoch
     epoch=$(cu_iso_to_epoch "$1") || return 0

@@ -60,7 +60,7 @@
         checks = {
           tests = pkgs.runCommand "claude-usage-tests"
             {
-              nativeBuildInputs = runtimeDeps ++ (with pkgs; [ findutils gnugrep tzdata util-linux ]);
+              nativeBuildInputs = runtimeDeps ++ (with pkgs; [ findutils gnugrep strace tzdata util-linux ]);
               TZDIR = "${pkgs.tzdata}/share/zoneinfo";
             } ''
             cp -r ${./.} src
