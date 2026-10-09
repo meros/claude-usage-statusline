@@ -179,7 +179,7 @@ cu_fetch() {
 }
 
 cu_read_cache() {
-    [ -f "$CU_CACHE_FILE" ] && cat "$CU_CACHE_FILE" || true
+    if [ -f "$CU_CACHE_FILE" ]; then cat "$CU_CACHE_FILE"; fi
 }
 
 # Atomic cache write. Clears any rate-limit backoff since we now have fresh data.
