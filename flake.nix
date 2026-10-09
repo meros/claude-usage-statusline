@@ -1,5 +1,5 @@
 {
-  description = "Claude API usage monitor with history, sparklines, and projections";
+  description = "Claude plan usage in your statusline, with history, sparklines and projections";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -10,54 +10,82 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        runtimeDeps = with pkgs; [ jq curl coreutils bash bc ];
-      in
-      {
-        packages.default = pkgs.stdenv.mkDerivation {
-          pname = "claude-usage-statusline";
-          version = "0.1.0";
+        lib = pkgs.lib;
 
+        # Tools the scripts call. flock (util-linux) is optional: without it
+        # parallel statuslines can each call the API once.
+        runtimeDeps = with pkgs; [ bash coreutils curl gawk git gnused jq ]
+          ++ lib.optional stdenv.isLinux util-linux;
+
+        claude-usage = pkgs.stdenv.mkDerivation {
+          pname = "claude-usage-statusline";
+          version = "0.2.0";
           src = ./.;
 
           nativeBuildInputs = [ pkgs.makeWrapper ];
 
           installPhase = ''
             mkdir -p $out/lib/claude-usage $out/share/claude-usage/views $out/bin
-
-            # Install library files
             cp lib/*.sh $out/lib/claude-usage/
-
-            # Install view files
             cp views/*.sh $out/share/claude-usage/views/
-
-            # Install and patch entrypoint
             cp bin/claude-usage $out/bin/claude-usage
             chmod +x $out/bin/claude-usage
 
             substituteInPlace $out/bin/claude-usage \
-              --replace '@LIB_DIR@' "$out/lib/claude-usage" \
-              --replace '@VIEWS_DIR@' "$out/share/claude-usage/views"
+              --replace-fail '@LIB_DIR@' "$out/lib/claude-usage" \
+              --replace-fail '@VIEWS_DIR@' "$out/share/claude-usage/views"
 
             wrapProgram $out/bin/claude-usage \
-              --prefix PATH : ${pkgs.lib.makeBinPath runtimeDeps}
+              --prefix PATH : ${lib.makeBinPath runtimeDeps}
           '';
 
-          meta = with pkgs.lib; {
-            description = "Claude API usage monitor with history and projections";
+          meta = with lib; {
+            description = "Claude plan usage in your statusline, with history and projections";
+            homepage = "https://github.com/meros/claude-usage-statusline";
             license = licenses.mit;
             platforms = platforms.unix;
             mainProgram = "claude-usage";
           };
         };
+      in
+      {
+        packages.default = claude-usage;
 
         apps.default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/claude-usage";
+          program = "${claude-usage}/bin/claude-usage";
         };
 
-        overlays.default = final: prev: {
-          claude-usage-statusline = self.packages.${system}.default;
+        # nix flake check: the test suite and shellcheck.
+        checks = {
+          tests = pkgs.runCommand "claude-usage-tests"
+            {
+              nativeBuildInputs = runtimeDeps ++ (with pkgs; [ findutils gnugrep tzdata util-linux ]);
+              TZDIR = "${pkgs.tzdata}/share/zoneinfo";
+            } ''
+            cp -r ${./.} src
+            chmod -R u+w src
+            patchShebangs src
+            bash src/tests/run-tests.sh
+            touch $out
+          '';
+
+          shellcheck = pkgs.runCommand "claude-usage-shellcheck"
+            { nativeBuildInputs = [ pkgs.shellcheck ]; } ''
+            cd ${./.}
+            shellcheck -x bin/claude-usage install.sh tests/*.sh tests/lib/*.sh
+            shellcheck -x -e SC2034,SC2154 lib/*.sh views/*.sh
+            touch $out
+          '';
+        };
+
+        devShells.default = pkgs.mkShell {
+          packages = runtimeDeps ++ (with pkgs; [ shellcheck charm-freeze ]);
         };
       }
-    );
+    ) // {
+      overlays.default = final: prev: {
+        claude-usage-statusline = self.packages.${prev.stdenv.hostPlatform.system}.default;
+      };
+    };
 }

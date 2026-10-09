@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016  # $HOME in scenario env is expanded per scenario
 # test-snapshots.sh - End-to-end output of every view against the demo dataset
 #
 # Each scenario runs bin/claude-usage as a process with a fresh copy of the
@@ -40,7 +41,7 @@ snap() {
         CU_NOW="$DEMO_NOW" CU_UPDATE_CHECK=0 \
         CU_DATA_DIR="$home/data" CU_CACHE_DIR="$home/cache" \
         CLAUDE_CONFIG_DIR="$home/claude" \
-        ${envs[@]+"${envs[@]}"} \
+        ${envs[@]+"${envs[@]//\$HOME/$home}"} \
         "$BIN" "$@" <<< "${SNAP_STDIN:-}" 2>&1) || true
 
     local file="$SNAP_DIR/$name.txt"
@@ -71,6 +72,12 @@ stale_cache() {
     touch -d "@$((DEMO_NOW - 60))" "$1/cache/rate-limit-backoff"
 }
 
+task_state() {
+    mkdir -p "$1/state"
+    echo "[api] fix login redirect" > "$1/state/pid-4242"
+    echo "2/5 tests ~15m" > "$1/state/progress-4242"
+}
+
 rate_limited_cache() {
     printf '{"_error":"rate_limited","_retry_at":%d}\n' "$((DEMO_NOW + 300))" > "$1/cache/api-response.json"
 }
@@ -84,6 +91,13 @@ snap statusline-modules CU_MODULES=pct,eta,reset -- statusline --multiline
 snap statusline-five-hour-only -- statusline --windows five_hour
 snap statusline-no-color -- statusline --multiline --no-color
 snap statusline-custom-endpoint ANTHROPIC_BASE_URL=http://127.0.0.1:4000 -- statusline --multiline
+snap statusline-no-header CU_HEADER_MODULES= -- statusline --multiline
+snap statusline-no-header-single CU_HEADER_MODULES= -- statusline
+snap statusline-pace-off CU_PACE_ENABLED=0 -- statusline --multiline
+snap statusline-pace-weekdays CU_PACE_WORK_DAYS=mon-thu CU_PACE_WORK_HOURS=09-17 -- statusline --multiline
+snap statusline-flat-eta CU_ETA_TEMPLATE=0 -- statusline --multiline
+snap statusline-thresholds CU_PCT_WARN=20 CU_PCT_CRIT=60 -- statusline --multiline
+SNAP_SETUP=task_state snap statusline-task CU_TASK_PID=4242 'CU_TASK_STATE_DIR=$HOME/state' -- statusline --multiline
 
 SNAP_STDIN=$(demo_stdin "$PROJECT" 0)
 snap statusline-from-cache -- statusline --no-fetch
@@ -96,6 +110,7 @@ echo ""
 echo "=== Other commands ==="
 snap dashboard -- show --no-fetch
 snap dashboard-block CU_SPARKLINE_TYPE=block -- show --no-fetch
+snap dashboard-flat-eta CU_ETA_TEMPLATE=0 -- show --no-fetch
 snap eta -- eta --no-fetch
 snap sparkline-long -- sparkline --no-fetch
 snap sparkline-short-braille -- sparkline --no-fetch --tier short --hours 5 --braille --width 16

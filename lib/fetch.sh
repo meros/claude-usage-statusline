@@ -1,45 +1,48 @@
 #!/usr/bin/env bash
-# fetch.sh - API fetch + caching
+# fetch.sh - Usage data: OAuth API fetch, rate-limit backoff, cache, stdin input
+#
+# The cache file holds the last good API response:
+#   {"five_hour": {"utilization": 30, "resets_at": "<iso>"}, "seven_day": {...}}
+# Its mtime is the time of the last successful refresh. When the API rate-limits
+# us before any data exists, the cache holds a sentinel instead:
+#   {"_error": "rate_limited", "_retry_at": <epoch>}
 
-CU_CACHE_FILE="${CU_CACHE_DIR}/api-response.json"
-CU_CACHE_MAX_AGE="${CU_CACHE_MAX_AGE:-300}"
-CU_BACKOFF_FILE="${CU_CACHE_DIR}/rate-limit-backoff"
+CU_USAGE_URL="${CU_USAGE_URL:-https://api.anthropic.com/api/oauth/usage}"
+CU_BACKOFF_MAX=1800  # cap for the exponential backoff, seconds
 
 cu_cache_is_fresh() {
     [ -f "$CU_CACHE_FILE" ] || return 1
-    local cache_age now file_mtime
-    now=$(cu_now)
-    file_mtime=$(stat -c %Y "$CU_CACHE_FILE" 2>/dev/null || stat -f %m "$CU_CACHE_FILE" 2>/dev/null || echo 0)
-    cache_age=$((now - file_mtime))
-    [ "$cache_age" -lt "$CU_CACHE_MAX_AGE" ]
+    [ "$(cu_file_age "$CU_CACHE_FILE")" -lt "$CU_CACHE_MAX_AGE" ]
 }
 
-# Check if we're in a rate-limit backoff period (separate from cache freshness)
-cu_is_backing_off() {
-    [ -f "$CU_BACKOFF_FILE" ] || return 1
-    local now backoff_mtime backoff_age backoff_dur
-    now=$(cu_now)
-    backoff_mtime=$(stat -c %Y "$CU_BACKOFF_FILE" 2>/dev/null || stat -f %m "$CU_BACKOFF_FILE" 2>/dev/null || echo 0)
-    backoff_age=$((now - backoff_mtime))
-    # Read stored backoff duration, default to CU_CACHE_MAX_AGE
-    backoff_dur=$(cat "$CU_BACKOFF_FILE" 2>/dev/null)
-    backoff_dur="${backoff_dur:-$CU_CACHE_MAX_AGE}"
-    [ "$backoff_age" -lt "$backoff_dur" ]
-}
-
-# Seconds since cache data was last actually updated by a successful API call
+# Seconds since the last successful refresh (0 when there is no cache).
 cu_cache_age() {
     [ -f "$CU_CACHE_FILE" ] || { echo 0; return; }
-    local now file_mtime
-    now=$(cu_now)
-    file_mtime=$(stat -c %Y "$CU_CACHE_FILE" 2>/dev/null || stat -f %m "$CU_CACHE_FILE" 2>/dev/null || echo 0)
-    echo $((now - file_mtime))
+    cu_file_age "$CU_CACHE_FILE"
 }
 
+# Current backoff duration in seconds (the backoff file holds it).
+cu_backoff_duration() {
+    local dur
+    dur=$(cat "$CU_BACKOFF_FILE" 2>/dev/null)
+    echo "${dur:-$CU_CACHE_MAX_AGE}"
+}
+
+# Seconds left in the rate-limit backoff; 0 or less when it is over.
+cu_backoff_remaining() {
+    [ -f "$CU_BACKOFF_FILE" ] || { echo 0; return; }
+    echo $(( $(cu_backoff_duration) - $(cu_file_age "$CU_BACKOFF_FILE") ))
+}
+
+cu_is_backing_off() {
+    [ "$(cu_backoff_remaining)" -gt 0 ]
+}
+
+# Print the Claude Code OAuth access token. Looks in
+# $CLAUDE_CONFIG_DIR/.credentials.json (default ~/.claude), then in the macOS
+# Keychain item "Claude Code-credentials".
 cu_resolve_token() {
     local token=""
-
-    # 1. Try credentials JSON file (Linux default, or macOS manual export)
     local cred_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
     cu_log "resolve_token: trying $cred_file"
     token=$(jq -r '.claudeAiOauth.accessToken // empty' "$cred_file" 2>/dev/null)
@@ -49,7 +52,6 @@ cu_resolve_token() {
         return 0
     fi
 
-    # 2. Try macOS Keychain (Claude Code stores creds here on macOS)
     if command -v security >/dev/null 2>&1; then
         local keychain_data
         keychain_data=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || true
@@ -68,115 +70,107 @@ cu_resolve_token() {
     return 1
 }
 
-CU_FETCH_LOCK="${CU_CACHE_DIR}/fetch.lock"
+# Take the fetch lock on fd 9 so parallel statuslines do not all call the API.
+# Returns 0 when this process should fetch, 1 when another process refreshed
+# the cache meanwhile (or still holds the lock). Without flock (macOS has none
+# by default) it fetches unlocked.
+_cu_fetch_lock() {
+    command -v flock >/dev/null 2>&1 || return 0
+    exec 9>"$CU_FETCH_LOCK"
+    flock -n 9 && return 0
 
+    cu_log "fetch: waiting for another process to finish fetching"
+    flock -w 10 9 2>/dev/null || true
+    exec 9>&-
+    cu_cache_is_fresh && return 1
+    # The other process failed; try once more ourselves.
+    exec 9>"$CU_FETCH_LOCK"
+    flock -n 9 && return 0
+    exec 9>&-
+    return 1
+}
+
+_cu_fetch_unlock() {
+    command -v flock >/dev/null 2>&1 || return 0
+    exec 9>&-
+}
+
+# Double the backoff on each consecutive rate-limit error, up to CU_BACKOFF_MAX.
+_cu_start_backoff() {
+    local retry_secs="$CU_CACHE_MAX_AGE"
+    if [ -f "$CU_BACKOFF_FILE" ]; then
+        retry_secs=$(( $(cu_backoff_duration) * 2 ))
+        [ "$retry_secs" -gt "$CU_BACKOFF_MAX" ] && retry_secs="$CU_BACKOFF_MAX"
+    fi
+    cu_log "fetch: rate limited, backing off ${retry_secs}s"
+    echo "$retry_secs" > "$CU_BACKOFF_FILE"
+    # The cache mtime is not touched: it shows when data was last updated.
+    if [ ! -f "$CU_CACHE_FILE" ]; then
+        cu_log "fetch: no cache exists, writing sentinel"
+        local tmp="${CU_CACHE_FILE}.tmp.$$"
+        printf '{"_error":"rate_limited","_retry_at":%d}\n' "$(( $(cu_now) + CU_CACHE_MAX_AGE ))" > "$tmp"
+        mv "$tmp" "$CU_CACHE_FILE"
+    fi
+}
+
+# Refresh the cache from the API. Skips the call while the cache is fresh or
+# during a rate-limit backoff, unless the first argument is "force".
+# Returns 0 when the cache holds fresh data afterwards.
 cu_fetch() {
     local force="${1:-}"
-    if [ "$force" != "force" ] && cu_cache_is_fresh; then
-        cu_log "fetch: cache is fresh, skipping"
-        return 0
-    fi
-    # Skip fetch during rate-limit backoff (but cache may be stale)
-    if [ "$force" != "force" ] && cu_is_backing_off; then
-        cu_log "fetch: in rate-limit backoff, skipping"
-        return 1
-    fi
-
-    # Acquire lock so multiple instances don't race for the API
-    # Use fd 9 for the lock to avoid conflicts with other file descriptors
-    local lock_acquired=""
-    exec 9>"$CU_FETCH_LOCK"
-    if flock -n 9 2>/dev/null; then
-        lock_acquired=1
-    else
-        # Another process is fetching — wait briefly then use its result
-        cu_log "fetch: waiting for another process to finish fetching"
-        flock -w 10 9 2>/dev/null || true
-        exec 9>&-
-        # Re-check cache — the other process should have refreshed it
+    if [ "$force" != "force" ]; then
         if cu_cache_is_fresh; then
-            cu_log "fetch: cache refreshed by another process"
+            cu_log "fetch: cache is fresh, skipping"
             return 0
         fi
-        # Other process may have failed — try fetching ourselves
-        exec 9>"$CU_FETCH_LOCK"
-        flock -n 9 2>/dev/null || { exec 9>&-; return 1; }
-        lock_acquired=1
+        if cu_is_backing_off; then
+            cu_log "fetch: in rate-limit backoff, skipping"
+            return 1
+        fi
     fi
 
-    # Double-check cache after acquiring lock (another process may have just finished)
+    if ! _cu_fetch_lock; then
+        cu_cache_is_fresh
+        return
+    fi
+    # Another process may have refreshed the cache while we waited.
     if [ "$force" != "force" ] && cu_cache_is_fresh; then
         cu_log "fetch: cache refreshed while waiting for lock"
-        exec 9>&-
+        _cu_fetch_unlock
         return 0
     fi
 
-    cu_log "fetch: resolving token"
-    local token
-    token=$(cu_resolve_token) || { exec 9>&-; return 1; }
-
+    local token resp
+    token=$(cu_resolve_token) || { _cu_fetch_unlock; return 1; }
     cu_log "fetch: calling API"
-    local resp
     resp=$(curl -s --max-time 5 \
         -H "Accept: application/json" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $token" \
         -H "anthropic-beta: oauth-2025-04-20" \
-        "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
-
-    # Release lock
-    exec 9>&-
+        "$CU_USAGE_URL" 2>/dev/null)
+    _cu_fetch_unlock
 
     if [ -z "$resp" ]; then
         cu_log "fetch: empty response (network error or timeout)"
         echo "API request failed (network error or timeout)." >&2
         return 1
     fi
-
     cu_log "fetch: got response (${#resp} bytes)"
 
-    # Accept response if it has at least one usage window (five_hour or seven_day)
     if echo "$resp" | jq -e '.five_hour // .seven_day' >/dev/null 2>&1; then
         cu_log "fetch: valid usage data, writing cache"
-        # Atomic write: write to temp file then rename
-        local tmp="${CU_CACHE_FILE}.tmp.$$"
-        echo "$resp" > "$tmp"
-        mv "$tmp" "$CU_CACHE_FILE"
-        # Clear backoff on success — reset exponential progression
-        rm -f "$CU_BACKOFF_FILE"
+        cu_write_cache "$resp"
         return 0
     fi
 
-    # Try to extract API error message
     local api_err err_type
     api_err=$(echo "$resp" | jq -r '.error.message // empty' 2>/dev/null)
     err_type=$(echo "$resp" | jq -r '.error.type // empty' 2>/dev/null)
     if [ -n "$api_err" ]; then
         cu_log "fetch: API error: $api_err"
         echo "API error: $api_err" >&2
-        # On rate limit, write a backoff marker to prevent hammering the API.
-        # The cache file's mtime is NOT touched — it reflects when data was last updated.
-        if [ "$err_type" = "rate_limit_error" ]; then
-            # Exponential backoff: read previous duration and double it (cap 30 min)
-            local retry_secs="${CU_CACHE_MAX_AGE}"
-            if [ -f "$CU_BACKOFF_FILE" ]; then
-                local prev_dur
-                prev_dur=$(cat "$CU_BACKOFF_FILE" 2>/dev/null)
-                prev_dur="${prev_dur:-$CU_CACHE_MAX_AGE}"
-                retry_secs=$((prev_dur * 2))
-                [ "$retry_secs" -gt 1800 ] && retry_secs=1800
-            fi
-            cu_log "fetch: rate limited, backing off ${retry_secs}s"
-            # Write backoff duration so cu_is_backing_off can use it
-            echo "$retry_secs" > "$CU_BACKOFF_FILE"
-            if [ ! -f "$CU_CACHE_FILE" ]; then
-                cu_log "fetch: no cache exists, writing sentinel"
-                local retry_at=$(($(cu_now) + CU_CACHE_MAX_AGE))
-                local tmp="${CU_CACHE_FILE}.tmp.$$"
-                printf '{"_error":"rate_limited","_retry_at":%d}\n' "$retry_at" > "$tmp"
-                mv "$tmp" "$CU_CACHE_FILE"
-            fi
-        fi
+        [ "$err_type" = "rate_limit_error" ] && _cu_start_backoff
     else
         cu_log "fetch: unexpected response: ${resp:0:200}"
         echo "Unexpected API response (no usage data). Token may be expired — try restarting Claude Code." >&2
@@ -186,6 +180,18 @@ cu_fetch() {
 
 cu_read_cache() {
     [ -f "$CU_CACHE_FILE" ] && cat "$CU_CACHE_FILE" || true
+}
+
+# Atomic cache write. Clears any rate-limit backoff since we now have fresh data.
+cu_write_cache() {
+    local payload="${1:-}"
+    [ -z "$payload" ] && return 1
+    mkdir -p "$CU_CACHE_DIR"
+    local tmp="${CU_CACHE_FILE}.tmp.$$"
+    printf '%s\n' "$payload" > "$tmp" && mv "$tmp" "$CU_CACHE_FILE"
+    rm -f "$CU_BACKOFF_FILE"
+    # A process killed between write and rename leaves its temp file behind.
+    find "$CU_CACHE_DIR" -maxdepth 1 -name 'api-response.json.tmp.*' -mmin +5 -delete 2>/dev/null || true
 }
 
 # Translate Claude Code v2.1.80+ stdin rate_limits into our cache schema.
@@ -213,32 +219,14 @@ cu_extract_piped_usage() {
     '
 }
 
-# Atomic cache write. Clears any rate-limit backoff since we now have fresh data.
-cu_write_cache() {
-    local payload="${1:-}"
-    [ -z "$payload" ] && return 1
-    mkdir -p "$CU_CACHE_DIR"
-    local tmp="${CU_CACHE_FILE}.tmp.$$"
-    printf '%s\n' "$payload" > "$tmp" && mv "$tmp" "$CU_CACHE_FILE"
-    rm -f "$CU_BACKOFF_FILE"
+# Fields of a cache payload (default: the cache file).
+# Usage: cu_usage_field WINDOW utilization|resets_at [DATA]
+cu_usage_field() {
+    local window="$1" key="$2" data="${3:-$(cu_read_cache)}"
+    echo "$data" | jq -r --arg w "$window" --arg k "$key" '.[$w][$k] // empty' 2>/dev/null
 }
 
-cu_get_five_hour_pct() {
-    local data="${1:-$(cu_read_cache)}"
-    echo "$data" | jq -r '.five_hour.utilization // empty' 2>/dev/null
-}
-
-cu_get_five_hour_reset() {
-    local data="${1:-$(cu_read_cache)}"
-    echo "$data" | jq -r '.five_hour.resets_at // empty' 2>/dev/null
-}
-
-cu_get_seven_day_pct() {
-    local data="${1:-$(cu_read_cache)}"
-    echo "$data" | jq -r '.seven_day.utilization // empty' 2>/dev/null
-}
-
-cu_get_seven_day_reset() {
-    local data="${1:-$(cu_read_cache)}"
-    echo "$data" | jq -r '.seven_day.resets_at // empty' 2>/dev/null
-}
+cu_get_five_hour_pct()   { cu_usage_field five_hour utilization "${1:-}"; }
+cu_get_five_hour_reset() { cu_usage_field five_hour resets_at "${1:-}"; }
+cu_get_seven_day_pct()   { cu_usage_field seven_day utilization "${1:-}"; }
+cu_get_seven_day_reset() { cu_usage_field seven_day resets_at "${1:-}"; }

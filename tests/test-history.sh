@@ -2,33 +2,7 @@
 # test-history.sh - Dual-tier history write/read/prune/migration tests
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Use temp dirs for isolation
-TEST_DIR=$(mktemp -d)
-trap 'rm -rf "$TEST_DIR"' EXIT
-
-export CU_DATA_DIR="$TEST_DIR/data"
-export CU_CACHE_DIR="$TEST_DIR/cache"
-export CU_NO_COLOR=1
-
-source "${SCRIPT_DIR}/../lib/util.sh"
-source "${SCRIPT_DIR}/../lib/fetch.sh"
-source "${SCRIPT_DIR}/../lib/history.sh"
-
-PASS=0
-FAIL=0
-
-assert_eq() {
-    local desc="$1" expected="$2" actual="$3"
-    if [ "$expected" = "$actual" ]; then
-        printf "  PASS: %s\n" "$desc"
-        PASS=$((PASS + 1))
-    else
-        printf "  FAIL: %s\n    expected: %q\n    actual:   %q\n" "$desc" "$expected" "$actual"
-        FAIL=$((FAIL + 1))
-    fi
-}
+source "$(dirname "${BASH_SOURCE[0]}")/lib/setup.sh"
 
 echo "=== Short Tier (5-min Dedup) Tests ==="
 
@@ -117,6 +91,8 @@ long_after=$(wc -l < "$CU_HISTORY_LONG")
 
 assert_eq "prune removes old short entries" "3" "$short_after"
 assert_eq "prune removes old long entries" "2" "$long_after"
+assert_nonzero "short tier had entries to prune" "$((short_before - short_after))"
+assert_nonzero "long tier had entries to prune" "$((long_before - long_after))"
 
 echo ""
 echo "=== Missing Fields Don't Create Wrong Tier Entries ==="
@@ -274,6 +250,4 @@ dump_output=$(cu_history_dump)
 assert_eq "dump shows short header" "1" "$(echo "$dump_output" | grep -c 'Short tier' || true)"
 assert_eq "dump shows long header" "1" "$(echo "$dump_output" | grep -c 'Long tier' || true)"
 
-echo ""
-printf "Results: %d passed, %d failed\n" "$PASS" "$FAIL"
-[ "$FAIL" -eq 0 ]
+assert_done

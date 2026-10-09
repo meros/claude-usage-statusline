@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck
+        run: |
+          shellcheck -x bin/claude-usage install.sh tests/*.sh tests/lib/*.sh
+          shellcheck -x -e SC2034,SC2154 lib/*.sh views/*.sh
+      - name: Tests
+        run: bash tests/run-tests.sh
+
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Flake check (tests + shellcheck in the Nix sandbox)
+        run: nix flake check -L
+      - name: Build and run
+        run: nix run . -- help

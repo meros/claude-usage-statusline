@@ -1,522 +1,312 @@
 #!/usr/bin/env bash
-# statusline.sh - Claude Code status view (single-line or multi-line)
-
-# Default module lists (can be overridden via CU_MODULES env var)
-_CU_DEFAULT_MODULES_SINGLE="pct,sparkline,rate,eta,reset"
-_CU_DEFAULT_MODULES_MULTI="bar,pct,sparkline,rate,eta,reset"
+# statusline.sh - Claude Code statusline (single-line or multi-line)
+#
+# Claude Code runs the statusline command after each message and passes
+# session JSON on stdin (workspace.current_dir, and since v2.1.80
+# rate_limits). Output layout:
+#
+#   single:    <header> | 5h: <modules> | 7d: <modules> | pace: ...
+#   multiline: <header>
+#              5h <modules, column-aligned>
+#              7d <modules, column-aligned>
+#              pa <pace bar>
 
 cu_view_statusline() {
-    local input
     if [ -t 0 ]; then
         echo "Error: statusline expects JSON on stdin" >&2
         return 1
     fi
+    local input
     input=$(cat)
     cu_log "statusline: stdin ${#input} bytes"
 
-    local cwd cwd_basename git_branch task_desc task_progress
+    local cwd cwd_basename git_branch="" task_desc task_progress
     cwd=$(echo "$input" | jq -r '.workspace.current_dir // empty' 2>/dev/null)
     cwd_basename=$(basename "${cwd:-.}")
-    git_branch=$(cd "$cwd" 2>/dev/null && git branch --show-current 2>/dev/null || true)
-
-    # Read per-instance task description from claude-tasks state.
-    # task-name-update.sh keys the file by the Claude process PID (pid-$CLAUDE_PID),
-    # found by walking up the parent chain to the first claude comm. The statusline
-    # is spawned by Claude, so the same walk from our own PID resolves the same PID.
-    task_desc=""
-    task_progress=""
-    local _tpid=$$ _claude_pid=""
-    while [ "$_tpid" -gt 1 ] 2>/dev/null; do
-        local _comm
-        _comm=$(cat /proc/"$_tpid"/comm 2>/dev/null) || break
-        case "$_comm" in
-            .claude-unwrapp*|claude) _claude_pid=$_tpid; break ;;
-        esac
-        _tpid=$(awk '{print $4}' /proc/"$_tpid"/stat 2>/dev/null) || break
-    done
-    if [ -n "$_claude_pid" ]; then
-        local _state_dir="$HOME/.local/state/claude-tasks"
-        [ -f "$_state_dir/pid-$_claude_pid" ] && task_desc=$(head -1 "$_state_dir/pid-$_claude_pid" 2>/dev/null || true)
-        # claude-task.sh renders the progress with its ETA counted down to now
-        # ("2/5 check + review · 12m left"); the raw file is the fallback.
-        task_progress=$("$HOME/.claude/hooks/claude-task.sh" summary 2>/dev/null) ||
-            { [ -f "$_state_dir/progress-$_claude_pid" ] && task_progress=$(head -1 "$_state_dir/progress-$_claude_pid" 2>/dev/null || true); }
-    fi
+    [ -n "$cwd" ] && git_branch=$(git -C "$cwd" branch --show-current 2>/dev/null || true)
+    cu_task_info
     cu_log "statusline: cwd=$cwd branch=$git_branch task=$task_desc progress=$task_progress"
 
-    # Prefer rate_limits piped by Claude Code v2.1.80+ — the /api/oauth/usage
-    # endpoint is aggressively rate-limited and unrecoverable once tripped
-    # (anthropics/claude-code#31637). Fall through to the API path only when
-    # stdin has no rate_limits (older CC, or first render before any response).
-    local _fetch_ok=""
-    local data=""
-    local _cache_stale=""
-    local five_pct="" seven_pct="" five_reset="" seven_reset="" cache_error=""
-
-    if ! cu_limits_disabled; then
-        local _piped_data
-        _piped_data=$(cu_extract_piped_usage "$input" 2>/dev/null || true)
-        if [ -n "$_piped_data" ]; then
-            cu_log "statusline: using rate_limits from stdin"
-            cu_write_cache "$_piped_data"
-            cu_history_record "$_piped_data"
-            _fetch_ok=1
-        elif [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
-            if cu_fetch; then
-                _fetch_ok=1
-                local cache_data
-                cache_data=$(cu_read_cache)
-                [ -n "$cache_data" ] && cu_history_record "$cache_data"
-            else
-                cu_log "statusline: fetch failed, using cached data"
-            fi
-        fi
-
-        data=$(cu_read_cache)
-
-        # Check staleness: data age > 2x cache TTL means we've failed to refresh
-        if [ -z "$_fetch_ok" ] && [ -f "$CU_CACHE_FILE" ]; then
-            local age
-            age=$(cu_cache_age)
-            [ "$age" -gt $((CU_CACHE_MAX_AGE * 2)) ] && _cache_stale=1
-        fi
-
-        # Parse usage data once
-        if [ -n "$data" ]; then
-            cache_error=$(echo "$data" | jq -r '._error // empty' 2>/dev/null)
-            five_pct=$(cu_get_five_hour_pct "$data")
-            seven_pct=$(cu_get_seven_day_pct "$data")
-            five_reset=$(cu_get_five_hour_reset "$data")
-            seven_reset=$(cu_get_seven_day_reset "$data")
-            cu_log "statusline: five_pct=$five_pct seven_pct=$seven_pct"
-        else
-            cu_log "statusline: no cached data available"
-        fi
-    else
+    local data="" cache_error="" _cache_stale=""
+    local five_pct="" seven_pct="" five_reset="" seven_reset=""
+    if cu_limits_disabled; then
         cu_log "statusline: usage limits disabled (custom endpoint or CU_NO_LIMITS)"
+    else
+        _cu_statusline_load_usage "$input"
     fi
 
-    # Trigger background update check
     cu_update_check_bg
 
     if [ "${CU_OPT_MULTILINE:-}" = "1" ]; then
-        cu_log "statusline: rendering multiline"
-        _statusline_multiline
+        _cu_statusline_multiline
     else
-        cu_log "statusline: rendering single-line"
-        _statusline_single
+        _cu_statusline_single
     fi
 }
 
-# Build staleness detail string: "(stale 1h 9m, backoff 10m)"
-_stale_detail() {
-    local age
-    age=$(cu_cache_age)
-    local parts="stale $(cu_fmt_duration "$age")"
-    if [ -f "$CU_BACKOFF_FILE" ]; then
-        local backoff_dur backoff_mtime backoff_remaining
-        backoff_dur=$(cat "$CU_BACKOFF_FILE" 2>/dev/null)
-        backoff_dur="${backoff_dur:-$CU_CACHE_MAX_AGE}"
-        backoff_mtime=$(stat -c %Y "$CU_BACKOFF_FILE" 2>/dev/null || stat -f %m "$CU_BACKOFF_FILE" 2>/dev/null || echo 0)
-        backoff_remaining=$(( backoff_dur - ($(cu_now) - backoff_mtime) ))
-        if [ "$backoff_remaining" -gt 0 ] 2>/dev/null; then
-            parts+=", retry $(cu_fmt_duration "$backoff_remaining")"
+# Refresh usage data and load it into the caller's variables.
+#
+# Prefer the rate_limits that Claude Code v2.1.80+ pipes on stdin: the
+# /api/oauth/usage endpoint is aggressively rate-limited and hard to recover
+# once tripped (anthropics/claude-code#31637). Call the API only when stdin
+# has no rate_limits (older Claude Code, or the first render of a session).
+_cu_statusline_load_usage() {
+    local input="$1" fetched="" piped
+    piped=$(cu_extract_piped_usage "$input" 2>/dev/null || true)
+    if [ -n "$piped" ]; then
+        cu_log "statusline: using rate_limits from stdin"
+        cu_write_cache "$piped"
+        cu_history_record "$piped"
+        fetched=1
+    elif [ "${CU_OPT_NO_FETCH:-}" != "1" ]; then
+        if cu_fetch_and_record; then
+            fetched=1
+        else
+            cu_log "statusline: fetch failed, using cached data"
         fi
     fi
+
+    data=$(cu_read_cache)
+    [ -z "$data" ] && { cu_log "statusline: no cached data available"; return 0; }
+
+    # Data older than twice the cache TTL means refreshes keep failing.
+    if [ -z "$fetched" ] && [ "$(cu_cache_age)" -gt $((CU_CACHE_MAX_AGE * 2)) ]; then
+        _cache_stale=1
+    fi
+    cache_error=$(echo "$data" | jq -r '._error // empty' 2>/dev/null)
+    five_pct=$(cu_get_five_hour_pct "$data")
+    seven_pct=$(cu_get_seven_day_pct "$data")
+    five_reset=$(cu_get_five_hour_reset "$data")
+    seven_reset=$(cu_get_seven_day_reset "$data")
+    cu_log "statusline: five_pct=$five_pct seven_pct=$seven_pct"
+}
+
+# "(stale 1h 9m, retry 10m)"
+_cu_stale_detail() {
+    local parts remaining
+    parts="stale $(cu_fmt_duration "$(cu_cache_age)")"
+    remaining=$(cu_backoff_remaining)
+    [ "$remaining" -gt 0 ] && parts+=", retry $(cu_fmt_duration "$remaining")"
     printf '%s(%s)%s' "$(cu_color "$CU_DIM")" "$parts" "$(cu_reset)"
 }
 
-# --- Module rendering functions ---
-# Each takes: window_field, pct, reset_time, and uses shared _eta_info_* vars
-
-_render_mod_bar() {
-    local pct_int="${1:-0}"
-    local width="${CU_BAR_WIDTH:-10}"
-    printf '%s' "$(cu_progress_bar "$pct_int" "$width")"
+# Header from CU_HEADER_MODULES: dir, branch, task (label and progress).
+_cu_statusline_header() {
+    local mod out=""
+    for mod in $(cu_words "$CU_HEADER_MODULES"); do
+        local part=""
+        case "$mod" in
+            dir)    part="$(cu_color "$CU_COLOR_DIR")${cwd_basename}$(cu_reset)" ;;
+            branch) [ -n "$git_branch" ] && part="$(cu_color "$CU_COLOR_BRANCH") ${git_branch}$(cu_reset)" ;;
+            task)
+                [ -n "$task_desc" ] && part="$(cu_color "$CU_COLOR_LABEL")· ${task_desc}$(cu_reset)"
+                [ -n "$task_progress" ] && part+="${part:+ }$(cu_color "$CU_DIM")(${task_progress})$(cu_reset)"
+                ;;
+        esac
+        [ -n "$part" ] && out+="${out:+ }$part"
+    done
+    printf '%s' "$out"
 }
 
-_render_mod_pct() {
-    local pct="${1:-0}"
-    cu_fmt_pct "$pct"
-}
-
-_render_mod_sparkline() {
-    local field="$1"
-    local spark_hours spark_tier spark_mode
-    case "$field" in
-        five_hour) spark_hours=5;   spark_tier="short" ;;
-        seven_day) spark_hours=168; spark_tier="long" ;;
-        *) return 0 ;;
+# Load window WIN (five_hour|seven_day) into _win_* and its projection into
+# _eta_*. Returns 1 for an unknown window or one without data.
+_cu_load_window() {
+    _win_field="$1"
+    cu_window_config "$_win_field" || return 1
+    case "$_win_field" in
+        five_hour) _win_pct="$five_pct";  _win_reset="$five_reset" ;;
+        seven_day) _win_pct="$seven_pct"; _win_reset="$seven_reset" ;;
     esac
-    spark_mode="${CU_SPARKLINE_TYPE:-braille}"
-    # Normalize: anything not "block" becomes "braille"
-    [ "$spark_mode" != "block" ] && spark_mode="braille"
-    local spark
-    spark=$(cu_sparkline_from_history "$field" "$spark_hours" 16 "$spark_mode" "$spark_tier" 2>/dev/null || true)
-    [ -n "$spark" ] && printf '%s%s%s' "$(cu_color "${CU_COLOR_SPARKLINE}")" "$spark" "$(cu_reset)"
+    [ -n "$_win_pct" ] || return 1
+    cu_window_eta "$_win_field" "$_win_avg" "$_win_pct" "$_win_reset"
+}
+
+# --- Modules ---------------------------------------------------------------
+# Each renders one piece of the loaded window; empty output hides it.
+
+_cu_mod_bar() {
+    cu_progress_bar "$_win_pct" "$CU_BAR_WIDTH"
+}
+
+_cu_mod_pct() {
+    cu_fmt_pct "$_win_pct"
+}
+
+_cu_mod_sparkline() {
+    local mode="braille" spark
+    [ "$CU_SPARKLINE_TYPE" = "block" ] && mode="block"
+    spark=$(cu_sparkline_from_history "$_win_field" "$_win_spark_hours" "$CU_SPARKLINE_WIDTH" "$mode" "$_win_tier" 2>/dev/null || true)
+    [ -n "$spark" ] && printf '%s%s%s' "$(cu_color "$CU_COLOR_SPARKLINE")" "$spark" "$(cu_reset)"
     return 0
 }
 
-_render_mod_rate() {
-    # Uses shared _eta_rate, _eta_secs, _before_reset from _compute_eta
-    [ -z "${_eta_rate:-}" ] && return 0
-    local avg_window="$1"
-    local rate_str
-    rate_str=$(cu_fmt_rate_per_window "$_eta_rate" "$avg_window")
-    if [ "${_before_reset:-}" = "1" ]; then
-        printf '%s%s%s' "$(cu_color "${CU_COLOR_WARN}")" "$rate_str" "$(cu_reset)"
-    else
-        printf '%s%s%s' "$(cu_color "${CU_COLOR_RATE}")" "$rate_str" "$(cu_reset)"
-    fi
+_cu_mod_rate() {
+    [ -n "$_eta_rate" ] || return 0
+    local color="$CU_COLOR_RATE"
+    [ "$_before_reset" = "1" ] && color="$CU_COLOR_WARN"
+    printf '%s%s%s' "$(cu_color "$color")" "$(cu_fmt_rate_per_window "$_eta_rate" "$_win_avg")" "$(cu_reset)"
 }
 
-_render_mod_eta() {
-    # Uses shared _eta_secs, _before_reset from _compute_eta
-    # Uses _win_reset from caller's scope for deadline-relative coloring
-    # Args: field (five_hour|seven_day) — determines duration vs date format
-    # When no projection available (rate=0, no data): hide entirely — reset module still shows
-    local field="${1:-}"
-    [ -z "${_eta_secs:-}" ] && return 0
-    [ "${_eta_secs:-0}" -le 0 ] 2>/dev/null && return 0
-    local eta_str
-    case "$field" in
-        seven_day) eta_str=$(cu_fmt_eta_date "$_eta_secs") ;;
-        *)         eta_str=$(cu_fmt_duration "$_eta_secs") ;;
-    esac
-    [ -z "$eta_str" ] && return 0
-
-    # Color based on how close ETA is to the reset deadline:
-    #   hits before reset (ratio <1)    → red
-    #   tight margin (ratio 1-1.2)      → yellow
-    #   comfortable (ratio >1.2)        → green
-    local color="$CU_RED"
-    if [ -n "${_win_reset:-}" ]; then
-        local secs_to_reset
-        secs_to_reset=$(cu_secs_until_reset "$_win_reset")
-        if [ "${secs_to_reset:-0}" -gt 0 ] 2>/dev/null && [ "$_eta_secs" -gt 0 ] 2>/dev/null; then
-            # ratio = eta_secs / secs_to_reset (>1 means won't hit before reset)
-            local pct_ratio
-            pct_ratio=$(awk -v e="$_eta_secs" -v r="$secs_to_reset" 'BEGIN { printf "%d", (e * 100) / r }')
-            if [ "$pct_ratio" -gt 120 ] 2>/dev/null; then
-                color="$CU_GREEN"
-            elif [ "$pct_ratio" -gt 100 ] 2>/dev/null; then
-                color="$CU_YELLOW"
-            fi
-        fi
-    fi
+# Hidden without a projection; the reset module still shows.
+_cu_mod_eta() {
+    [ "${_eta_secs:-0}" -gt 0 ] 2>/dev/null || return 0
+    local eta_str color="$CU_COLOR_ETA"
+    eta_str=$(cu_fmt_eta "$_win_field" "$_eta_secs")
+    [ -n "$eta_str" ] || return 0
+    [ -z "$color" ] && color=$(cu_eta_color "$_eta_secs" "$_win_reset")
     printf '%s~%s%s' "$(cu_color "$color")" "$eta_str" "$(cu_reset)"
 }
 
-_render_mod_reset() {
-    local field="$1" reset_time="$2"
-    [ -z "$reset_time" ] && return 0
-
-    local icon="↻"
-
-    local reset_str=""
-    case "$field" in
-        five_hour)
-            local secs
-            secs=$(cu_secs_until_reset "$reset_time")
-            if [ "${secs:-0}" -gt 0 ] 2>/dev/null; then
-                reset_str=$(cu_fmt_duration "$secs")
-            else
-                reset_str="now"
-            fi
-            ;;
-        seven_day)
-            reset_str=$(cu_fmt_reset_date "$reset_time")
-            ;;
-    esac
-    [ -z "$reset_str" ] && return 0
-    printf '%s%s%s %s%s%s' \
-        "$(cu_color "${CU_COLOR_RESET_ICON}")" "$icon" "$(cu_reset)" \
-        "$(cu_color "${CU_COLOR_RESET}")" "$reset_str" "$(cu_reset)"
-}
-
-# Compute ETA projection, storing results in shared variables.
-#
-# Two-track approach:
-#   - rate module always reflects instantaneous burn (sum of positive deltas
-#     over the rate window) — so the user sees what their pace is *right now*.
-#   - eta module's secs/before_reset come from the seasonal template for
-#     seven_day when enough history is available; otherwise from the same
-#     flat-rate extrapolation as the rate module.
-_compute_eta() {
-    local field="$1" avg_window="$2"
-    _eta_rate="" _eta_hours="" _eta_secs="" _before_reset=""
-    local eta_info
-    eta_info=$(cu_eta_projection "$field" "$avg_window" 2>/dev/null || true)
-    if [ -n "$eta_info" ]; then
-        read -r _eta_rate _eta_hours _eta_secs _before_reset <<< "$eta_info"
+_cu_mod_reset() {
+    [ -n "$_win_reset" ] || return 0
+    local reset_str secs
+    if [ "$_win_field" = "five_hour" ]; then
+        secs=$(cu_secs_until_reset "$_win_reset")
+        reset_str="now"
+        [ "${secs:-0}" -gt 0 ] 2>/dev/null && reset_str=$(cu_fmt_duration "$secs")
     else
-        # No projection available — set rate to 0 so rate module still displays
-        _eta_rate="0"
+        reset_str=$(cu_fmt_reset_date "$_win_reset")
     fi
-
-    # For seven_day, replace the flat-rate ETA with a seasonal template
-    # forecast that accounts for hour-of-day + day-of-week patterns.
-    if [ "$field" = "seven_day" ] && [ -n "${_win_reset:-}" ]; then
-        local secs_to_reset
-        secs_to_reset=$(cu_secs_until_reset "$_win_reset")
-        if [ "${secs_to_reset:-0}" -gt 0 ] 2>/dev/null; then
-            local current_util="${_win_pct%.*}"
-            local tmpl
-            tmpl=$(cu_eta_template_seven_day "${current_util:-0}" "$secs_to_reset" 2>/dev/null || true)
-            if [ -n "$tmpl" ]; then
-                # tmpl: "secs_to_cap before_reset_flag"  (secs=0 → no hit)
-                local _t_secs _t_flag
-                read -r _t_secs _t_flag <<< "$tmpl"
-                _eta_secs="${_t_secs:-0}"
-                _before_reset="${_t_flag:-}"
-            fi
-        fi
-    fi
+    [ -n "$reset_str" ] || return 0
+    printf '%s↻%s %s%s%s' \
+        "$(cu_color "$CU_COLOR_RESET_ICON")" "$(cu_reset)" \
+        "$(cu_color "$CU_COLOR_RESET")" "$reset_str" "$(cu_reset)"
 }
 
-# Get window config: field, pct, reset_time, avg_window, label
-_window_config() {
-    local win="$1"
-    case "$win" in
-        five_hour)
-            _win_field="five_hour"
-            _win_pct="$five_pct"
-            _win_reset="$five_reset"
-            _win_avg="${CU_ETA_5H_AVG:-1}"
-            _win_label="5h"
-            ;;
-        seven_day)
-            _win_field="seven_day"
-            _win_pct="$seven_pct"
-            _win_reset="$seven_reset"
-            _win_avg="${CU_ETA_7D_AVG:-24}"
-            _win_label="7d"
-            ;;
-        *) return 1 ;;
+# Render module MOD of the loaded window. Unknown modules print nothing.
+_cu_render_module() {
+    case "$1" in
+        bar|pct|sparkline|rate|eta|reset) "_cu_mod_$1" ;;
     esac
 }
 
-# --- Single-line layout ---
+# --- Single-line layout ----------------------------------------------------
 
-_statusline_single() {
-    local modules="${CU_MODULES:-${_CU_DEFAULT_MODULES_SINGLE}}"
+_cu_statusline_single() {
+    local modules="${CU_MODULES:-$CU_DEFAULT_MODULES_SINGLE}"
+    local sep
+    sep="$(cu_color "$CU_DIM")|$(cu_reset)"
 
-    # Build directory + git branch + task section
-    local dir_section
-    if [ -n "$git_branch" ]; then
-        dir_section="$(cu_color "${CU_COLOR_DIR}")${cwd_basename}$(cu_reset) $(cu_color "${CU_COLOR_BRANCH}") ${git_branch}$(cu_reset)"
-    else
-        dir_section="$(cu_color "${CU_COLOR_DIR}")${cwd_basename}$(cu_reset)"
-    fi
-    if [ -n "$task_desc" ]; then
-        dir_section+=" $(cu_color "${CU_COLOR_LABEL}")· ${task_desc}$(cu_reset)"
-    fi
-    if [ -n "$task_progress" ]; then
-        dir_section+=" $(cu_color "$CU_DIM")(${task_progress})$(cu_reset)"
-    fi
+    local -a segments=()
+    local header
+    header=$(_cu_statusline_header)
+    [ -n "$header" ] && segments+=("$header")
 
-    # Build usage section
-    local usage_section=""
     if [ -n "$cache_error" ]; then
-        usage_section=" $(cu_color "$CU_DIM")rate limited, retrying soon$(cu_reset)"
+        segments+=("$(cu_color "$CU_DIM")rate limited, retrying soon$(cu_reset)")
     elif [ -n "$data" ]; then
-        local parts=()
-        local _win
-        for _win in ${CU_WINDOWS//,/ }; do
-            local _win_field _win_pct _win_reset _win_avg _win_label
-            _window_config "$_win" || continue
-            [ -z "$_win_pct" ] && continue
-
-            local pct_int="${_win_pct%.*}"
-            pct_int="${pct_int:-0}"
-
-            # Compute ETA once for this window (shared by rate + eta modules)
-            _compute_eta "$_win_field" "$_win_avg"
-
-            # Build this window's part from modules
-            local win_part=""
-            win_part+="$(cu_color "${CU_COLOR_LABEL}")${_win_label}:$(cu_reset) "
-
-            local _mod first_mod=1
-            for _mod in ${modules//,/ }; do
-                local mod_out=""
-                case "$_mod" in
-                    bar) continue ;;  # bar is multiline-only
-                    pct)       mod_out=$(_render_mod_pct "$_win_pct") ;;
-                    sparkline) mod_out=$(_render_mod_sparkline "$_win_field") ;;
-                    rate)      mod_out=$(_render_mod_rate "$_win_avg") ;;
-                    eta)       mod_out=$(_render_mod_eta "$_win_field") ;;
-                    reset)     mod_out=$(_render_mod_reset "$_win_field" "$_win_reset") ;;
-                    *) continue ;;
-                esac
-                if [ -n "$mod_out" ]; then
-                    [ "$first_mod" = "1" ] && first_mod=0 || win_part+=" "
-                    win_part+="$mod_out"
-                fi
+        local win
+        for win in $(cu_words "$CU_WINDOWS"); do
+            local _win_field _win_pct _win_reset _win_avg _win_label _win_title _win_spark_hours _win_tier
+            local _eta_rate _eta_secs _before_reset
+            _cu_load_window "$win" || continue
+            local part mod out
+            part="$(cu_color "$CU_COLOR_LABEL")${_win_label}:$(cu_reset)"
+            for mod in $(cu_words "$modules"); do
+                [ "$mod" = "bar" ] && continue  # bar is multiline-only
+                out=$(_cu_render_module "$mod")
+                [ -n "$out" ] && part+=" $out"
             done
-            parts+=("$win_part")
+            segments+=("$part")
         done
-
-        if [ ${#parts[@]} -gt 0 ]; then
-            usage_section=" $(cu_color "$CU_DIM")|$(cu_reset) "
-            local first=1
-            for part in "${parts[@]}"; do
-                [ "$first" = "1" ] && first=0 || usage_section+=" $(cu_color "$CU_DIM")|$(cu_reset) "
-                usage_section+="$part"
-            done
-        fi
     fi
 
-    printf "%s%s" "$dir_section" "$usage_section"
+    local line="" i
+    for i in "${!segments[@]}"; do
+        if [ "$i" -eq 0 ]; then
+            line="${segments[$i]}"
+        elif [ "$i" -eq 1 ] && [ -n "$header" ] && [ -n "$cache_error" ]; then
+            line+=" ${segments[$i]}"
+        else
+            line+=" $sep ${segments[$i]}"
+        fi
+    done
+    printf '%s' "$line"
 
-    # Staleness warning
-    [ "$_cache_stale" = "1" ] && printf " %s" "$(_stale_detail)"
-
-    # Optional pacing segment (renders nothing when contract file is absent/stale)
-    declare -F cu_pace_render_inline >/dev/null && cu_pace_render_inline "$seven_pct" "$seven_reset"
-
-    # Update notification (appended at end of line)
+    [ "$_cache_stale" = "1" ] && printf ' %s' "$(_cu_stale_detail)"
+    cu_pace_render_inline "$seven_pct" "$seven_reset"
     local update_msg
     update_msg=$(cu_update_message)
-    [ -n "$update_msg" ] && printf " %s" "$update_msg"
+    [ -n "$update_msg" ] && printf ' %s' "$update_msg"
     return 0
 }
 
-# --- Multi-line layout ---
+# --- Multi-line layout -----------------------------------------------------
 
-_statusline_multiline() {
-    local modules="${CU_MODULES:-${_CU_DEFAULT_MODULES_MULTI}}"
+_cu_statusline_multiline() {
+    local modules="${CU_MODULES:-$CU_DEFAULT_MODULES_MULTI}"
+    local nl=""  # newline before each row, except a first row without header
 
-    # Line 1: directory + branch + task
-    if [ -n "$git_branch" ]; then
-        printf "%s%s%s %s %s%s" \
-            "$(cu_color "${CU_COLOR_DIR}")" "$cwd_basename" "$(cu_reset)" \
-            "$(cu_color "${CU_COLOR_BRANCH}")" "$git_branch" "$(cu_reset)"
-    else
-        printf "%s%s%s" "$(cu_color "${CU_COLOR_DIR}")" "$cwd_basename" "$(cu_reset)"
-    fi
-    if [ -n "$task_desc" ]; then
-        printf " %s· %s%s" "$(cu_color "${CU_COLOR_LABEL}")" "$task_desc" "$(cu_reset)"
-    fi
-    if [ -n "$task_progress" ]; then
-        printf " %s(%s)%s" "$(cu_color "$CU_DIM")" "$task_progress" "$(cu_reset)"
+    local header
+    header=$(_cu_statusline_header)
+    if [ -n "$header" ]; then
+        printf '%s' "$header"
+        nl=$'\n'
     fi
 
-    if [ -z "$data" ]; then return 0; fi
-
+    [ -n "$data" ] || return 0
     if [ -n "$cache_error" ]; then
-        local retry_at detail="retrying soon"
+        local retry_at detail="retrying soon" secs_left
         retry_at=$(echo "$data" | jq -r '._retry_at // empty' 2>/dev/null)
         if [ -n "$retry_at" ]; then
-            local secs_left=$(( retry_at - $(cu_now) ))
+            secs_left=$(( retry_at - $(cu_now) ))
             [ "$secs_left" -gt 0 ] && detail="retry in $(cu_fmt_duration "$secs_left")"
         fi
-        printf '\n%sAPI rate limited, %s%s' \
-            "$(cu_color "$CU_DIM")" "$detail" "$(cu_reset)"
+        printf '%s%sAPI rate limited, %s%s' "$nl" "$(cu_color "$CU_DIM")" "$detail" "$(cu_reset)"
         return 0
     fi
 
-    # Build module list as array for indexed access
-    local mod_list=()
-    local _m
-    for _m in ${modules//,/ }; do
-        mod_list+=("$_m")
+    local -a mods=() labels=() cells=() widths=() col_max=()
+    local mod win
+    for mod in $(cu_words "$modules"); do mods+=("$mod"); col_max+=(0); done
+    local num_mods=${#mods[@]}
+
+    # Pass 1: render every cell and measure the widest one per column.
+    # cells/widths are flat arrays indexed by row * num_mods + column.
+    local row=0 mi idx out w
+    for win in $(cu_words "$CU_WINDOWS"); do
+        local _win_field _win_pct _win_reset _win_avg _win_label _win_title _win_spark_hours _win_tier
+        local _eta_rate _eta_secs _before_reset
+        cu_window_config "$win" || continue
+        labels[row]="$_win_label"
+        local have_data=1
+        _cu_load_window "$win" || have_data=0
+        for (( mi = 0; mi < num_mods; mi++ )); do
+            idx=$(( row * num_mods + mi ))
+            out=""
+            [ "$have_data" = "1" ] && out=$(_cu_render_module "${mods[$mi]}")
+            w=0
+            [ -n "$out" ] && w=$(cu_visible_len "$out")
+            cells[idx]="$out"
+            widths[idx]=$w
+            [ "$w" -gt "${col_max[mi]}" ] && col_max[mi]=$w
+        done
+        row=$((row + 1))
     done
-    local num_mods=${#mod_list[@]}
 
-    # Collect windows into array
-    local win_list=()
-    for _m in ${CU_WINDOWS//,/ }; do
-        win_list+=("$_m")
-    done
-    local num_wins=${#win_list[@]}
-
-    # --- Pass 1: render all modules, measure visible widths ---
-    # Flat arrays indexed by [win * num_mods + mod]
-    local _ml_out=()    # rendered output strings
-    local _ml_width=()  # visible widths
-    local _ml_max=()    # max width per module column
-    local _ml_label=()  # window labels
-
-    local wi mi idx
-    for (( mi=0; mi<num_mods; mi++ )); do
-        _ml_max[$mi]=0
+    # The last column that has any output is not padded (no trailing spaces).
+    local last_col=-1
+    for (( mi = 0; mi < num_mods; mi++ )); do
+        [ "${col_max[mi]}" -gt 0 ] && last_col=$mi
     done
 
-    for (( wi=0; wi<num_wins; wi++ )); do
-        local _win_field _win_pct _win_reset _win_avg _win_label
-        _window_config "${win_list[$wi]}" || continue
-        _ml_label[$wi]="$_win_label"
-
-        if [ -z "$_win_pct" ]; then
-            # No data for this window — fill with empty
-            for (( mi=0; mi<num_mods; mi++ )); do
-                idx=$(( wi * num_mods + mi ))
-                _ml_out[$idx]=""
-                _ml_width[$idx]=0
-            done
-            continue
-        fi
-
-        local pct_int="${_win_pct%.*}"
-        pct_int="${pct_int:-0}"
-
-        _compute_eta "$_win_field" "$_win_avg"
-
-        for (( mi=0; mi<num_mods; mi++ )); do
-            idx=$(( wi * num_mods + mi ))
-            local mod_out=""
-            case "${mod_list[$mi]}" in
-                bar)       mod_out=$(_render_mod_bar "$pct_int") ;;
-                pct)       mod_out=$(_render_mod_pct "$_win_pct") ;;
-                sparkline) mod_out=$(_render_mod_sparkline "$_win_field") ;;
-                rate)      mod_out=$(_render_mod_rate "$_win_avg") ;;
-                eta)       mod_out=$(_render_mod_eta "$_win_field") ;;
-                reset)     mod_out=$(_render_mod_reset "$_win_field" "$_win_reset") ;;
-                *) ;;
-            esac
-            _ml_out[$idx]="$mod_out"
-            local vlen=0
-            [ -n "$mod_out" ] && vlen=$(cu_visible_len "$mod_out")
-            _ml_width[$idx]=$vlen
-            [ "$vlen" -gt "${_ml_max[$mi]}" ] && _ml_max[$mi]=$vlen
+    # Pass 2: print rows with columns padded to the widest cell.
+    local r
+    for (( r = 0; r < row; r++ )); do
+        printf '%s%s%s%s' "$nl" "$(cu_color "$CU_COLOR_LABEL")" "${labels[$r]}" "$(cu_reset)"
+        nl=$'\n'
+        for (( mi = 0; mi < num_mods; mi++ )); do
+            [ "${col_max[mi]}" -eq 0 ] && continue
+            idx=$(( r * num_mods + mi ))
+            printf ' %s' "${cells[$idx]}"
+            [ "$mi" -lt "$last_col" ] && printf '%*s' $(( col_max[mi] - widths[idx] )) ""
         done
     done
 
-    # --- Pass 2: output with column padding ---
-    for (( wi=0; wi<num_wins; wi++ )); do
-        printf "\n"
-        printf "%s%s%s " "$(cu_color "${CU_COLOR_LABEL}")" "${_ml_label[$wi]}" "$(cu_reset)"
-
-        local first_mod=1
-        for (( mi=0; mi<num_mods; mi++ )); do
-            idx=$(( wi * num_mods + mi ))
-            local out="${_ml_out[$idx]}"
-            local w="${_ml_width[$idx]}"
-            local max_w="${_ml_max[$mi]}"
-
-            # Skip columns where no window produced output
-            [ "$max_w" -eq 0 ] && continue
-
-            [ "$first_mod" = "1" ] && first_mod=0 || printf " "
-
-            printf "%s" "$out"
-
-            # Right-pad to align columns (only if not the last visible column)
-            local pad=$(( max_w - w ))
-            [ "$pad" -gt 0 ] && printf "%*s" "$pad" ""
-        done
-    done
-
-    # Staleness warning
-    [ "$_cache_stale" = "1" ] && printf " %s" "$(_stale_detail)"
-
-    # Optional pacing row (renders nothing when contract file is absent/stale)
-    declare -F cu_pace_render_multiline >/dev/null && cu_pace_render_multiline "$seven_pct" "$seven_reset"
-
-    # Update notification on its own line
+    [ "$_cache_stale" = "1" ] && printf ' %s' "$(_cu_stale_detail)"
+    cu_pace_render_multiline "$seven_pct" "$seven_reset"
     local update_msg
     update_msg=$(cu_update_message)
-    [ -n "$update_msg" ] && printf "\n%s" "$update_msg"
+    [ -n "$update_msg" ] && printf '\n%s' "$update_msg"
     return 0
 }

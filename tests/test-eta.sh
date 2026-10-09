@@ -1,58 +1,9 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # read -r fills fields the test does not check
 # test-eta.sh - ETA calculation tests (moving average + dual windows + tiers)
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-TEST_DIR=$(mktemp -d)
-trap 'rm -rf "$TEST_DIR"' EXIT
-
-export CU_DATA_DIR="$TEST_DIR/data"
-export CU_CACHE_DIR="$TEST_DIR/cache"
-export CU_NO_COLOR=1
-
-source "${SCRIPT_DIR}/../lib/util.sh"
-source "${SCRIPT_DIR}/../lib/fetch.sh"
-source "${SCRIPT_DIR}/../lib/history.sh"
-source "${SCRIPT_DIR}/../lib/render.sh"
-
-PASS=0
-FAIL=0
-
-assert_eq() {
-    local desc="$1" expected="$2" actual="$3"
-    if [ "$expected" = "$actual" ]; then
-        printf "  PASS: %s\n" "$desc"
-        PASS=$((PASS + 1))
-    else
-        printf "  FAIL: %s\n    expected: %q\n    actual:   %q\n" "$desc" "$expected" "$actual"
-        FAIL=$((FAIL + 1))
-    fi
-}
-
-assert_nonzero() {
-    local desc="$1" actual="$2"
-    if [ -n "$actual" ] && [ "$actual" != "0" ]; then
-        printf "  PASS: %s\n" "$desc"
-        PASS=$((PASS + 1))
-    else
-        printf "  FAIL: %s (expected non-zero, got %q)\n" "$desc" "$actual"
-        FAIL=$((FAIL + 1))
-    fi
-}
-
-assert_range() {
-    local desc="$1" min="$2" max="$3" actual="$4"
-    local in_range
-    in_range=$(awk -v a="$actual" -v lo="$min" -v hi="$max" 'BEGIN { print (a >= lo && a <= hi) ? 1 : 0 }')
-    if [ "$in_range" = "1" ]; then
-        printf "  PASS: %s (got %s, range [%s, %s])\n" "$desc" "$actual" "$min" "$max"
-        PASS=$((PASS + 1))
-    else
-        printf "  FAIL: %s (got %s, expected range [%s, %s])\n" "$desc" "$actual" "$min" "$max"
-        FAIL=$((FAIL + 1))
-    fi
-}
+source "$(dirname "${BASH_SOURCE[0]}")/lib/setup.sh"
 
 echo "=== Moving Average ETA Tests (Long Tier) ==="
 
@@ -60,7 +11,7 @@ echo "=== Moving Average ETA Tests (Long Tier) ==="
 export CU_NOW=1709053200
 while IFS= read -r line; do
     echo "$line" | jq -c '{ts: .ts, seven_day: .seven_day}'
-done < "${SCRIPT_DIR}/fixtures/history.jsonl" > "$CU_HISTORY_LONG"
+done < "${TESTS_DIR}/fixtures/history.jsonl" > "$CU_HISTORY_LONG"
 
 eta_info=$(cu_eta_projection "seven_day" 24 "long" 2>/dev/null)
 assert_nonzero "seven_day eta from long tier produces output" "$eta_info"
@@ -78,7 +29,7 @@ echo "=== Five-Hour ETA from Short Tier ==="
 # Set up short tier fixture (five_hour only)
 while IFS= read -r line; do
     echo "$line" | jq -c '{ts: .ts, five_hour: .five_hour}'
-done < "${SCRIPT_DIR}/fixtures/history.jsonl" > "$CU_HISTORY_SHORT"
+done < "${TESTS_DIR}/fixtures/history.jsonl" > "$CU_HISTORY_SHORT"
 
 eta_info=$(cu_eta_projection "five_hour" 3 "short" 2>/dev/null || true)
 # five_hour has non-monotonic data (resets), so positive-only filtering matters
@@ -95,7 +46,7 @@ echo ""
 echo "=== Known Rate: Constant 5%/hour (Long Tier) ==="
 
 # Create long history with exact +5%/h: 10, 15, 20, 25, 30 over 5 hours
-> "$CU_HISTORY_LONG"
+: > "$CU_HISTORY_LONG"
 local_base=1700000000
 for i in 0 1 2 3 4; do
     ts=$((local_base + i * 3600))
@@ -120,7 +71,7 @@ echo ""
 echo "=== Known Rate: Constant 5%/hour (Short Tier) ==="
 
 # Same data but for five_hour in short tier
-> "$CU_HISTORY_SHORT"
+: > "$CU_HISTORY_SHORT"
 local_base=1700000000
 for i in 0 1 2 3 4; do
     ts=$((local_base + i * 3600))
@@ -142,7 +93,7 @@ echo ""
 echo "=== Spiky Data: Wall-Clock Rate ==="
 
 # Create long history with a spike: 10, 50, 15, 20, 25
-> "$CU_HISTORY_LONG"
+: > "$CU_HISTORY_LONG"
 local_base=1700000000
 vals=(10 50 15 20 25)
 for i in 0 1 2 3 4; do
@@ -188,7 +139,7 @@ echo "=== Noisy Data: Sum of Positive Deltas ==="
 # Values: 10, 12, 11, 14, 13, 16, 15, 18 over 7 hours.
 # Positive deltas: +2, -1(skip), +3, -1(skip), +3, -1(skip), +3 = 11.
 # Window=10h → rate = 11/10 = 1.1 %/h
-> "$CU_HISTORY_LONG"
+: > "$CU_HISTORY_LONG"
 local_base=1700000000
 noisy_vals=(10 12 11 14 13 16 15 18)
 for i in "${!noisy_vals[@]}"; do
@@ -209,7 +160,7 @@ echo ""
 echo "=== Configurable Window Size ==="
 
 # Restore spiky data for this test: 10, 50, 15, 20, 25
-> "$CU_HISTORY_LONG"
+: > "$CU_HISTORY_LONG"
 local_base=1700000000
 vals=(10 50 15 20 25)
 for i in 0 1 2 3 4; do
@@ -231,7 +182,7 @@ echo ""
 echo "=== Zero Rate When No Real Data ==="
 
 # Empty long history → rate=0, no projection
-> "$CU_HISTORY_LONG"
+: > "$CU_HISTORY_LONG"
 eta_info=$(cu_eta_projection "seven_day" 24 "long" 2>/dev/null || true)
 read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
 assert_eq "empty history → rate=0" "0" "${rate%.*}"
@@ -248,7 +199,7 @@ echo "=== Only Negative Deltas (Decreasing Usage) ==="
 
 # Usage going down: 50, 40, 30. Every delta is negative — treated as resets.
 # No positive deltas → rate=0.
-> "$CU_HISTORY_LONG"
+: > "$CU_HISTORY_LONG"
 local_base=1700000000
 for i in 0 1 2; do
     ts=$((local_base + i * 3600))
@@ -267,7 +218,7 @@ echo "=== Gap Handling: Weekend Gap (Real-World Scenario) ==="
 
 # Simulate: active Fri (12%), offline Sat-Sun, back Mon (still 12% → 16%)
 # Window=24h should use last known value before gap (12%), not interpolate
-> "$CU_HISTORY_LONG"
+: > "$CU_HISTORY_LONG"
 local_base=1700000000
 # Friday active: hourly readings 8%→12% over 4 hours
 for i in 0 1 2 3 4; do
@@ -299,7 +250,7 @@ echo "=== Gap Handling: Both Sides of Reset Within Window ==="
 
 # Heavy day: 80%→100% (pre-reset +20%), reset to 0%, then 0%→16% (post +16%)
 # Total consumption = 36% over 24h = 1.5%/h
-> "$CU_HISTORY_LONG"
+: > "$CU_HISTORY_LONG"
 local_base=1700000000
 # Pre-reset: 80→90→100 over 4 hours
 for i in 0 1 2; do
@@ -330,7 +281,7 @@ echo ""
 echo "=== Gap Handling: Reset Hidden in Gap ==="
 
 # Data before gap: 80%. Gap spans a reset. After gap: 5% → 8%
-> "$CU_HISTORY_LONG"
+: > "$CU_HISTORY_LONG"
 local_base=1700000000
 # Before gap: 70%→80% over 2 hours
 for i in 0 1 2; do
@@ -364,7 +315,7 @@ echo "=== Gap Handling: All Data After Window Start ==="
 
 # Only have 2 hours of data, window is 24h
 # Should clamp but require minimum coverage
-> "$CU_HISTORY_LONG"
+: > "$CU_HISTORY_LONG"
 local_base=1700000000
 for i in 0 1 2 3 4; do
     ts=$((local_base + i * 1800))  # 30-min intervals, 2h total
@@ -393,12 +344,14 @@ echo ""
 echo "=== Gap Handling: Multiple Gaps Within Window ==="
 
 # Data: 10% at t=0, gap, 14% at t=10h, gap, 18% at t=20h, 20% at t=24h
-> "$CU_HISTORY_LONG"
+: > "$CU_HISTORY_LONG"
 local_base=1700000000
-echo "{\"ts\":$local_base,\"seven_day\":{\"util\":10,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
-echo "{\"ts\":$((local_base + 10 * 3600)),\"seven_day\":{\"util\":14,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
-echo "{\"ts\":$((local_base + 20 * 3600)),\"seven_day\":{\"util\":18,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
-echo "{\"ts\":$((local_base + 24 * 3600)),\"seven_day\":{\"util\":20,\"resets_at\":\"\"}}" >> "$CU_HISTORY_LONG"
+{
+    echo "{\"ts\":$local_base,\"seven_day\":{\"util\":10,\"resets_at\":\"\"}}"
+    echo "{\"ts\":$((local_base + 10 * 3600)),\"seven_day\":{\"util\":14,\"resets_at\":\"\"}}"
+    echo "{\"ts\":$((local_base + 20 * 3600)),\"seven_day\":{\"util\":18,\"resets_at\":\"\"}}"
+    echo "{\"ts\":$((local_base + 24 * 3600)),\"seven_day\":{\"util\":20,\"resets_at\":\"\"}}"
+} >> "$CU_HISTORY_LONG"
 export CU_NOW=$((local_base + 24 * 3600))
 
 eta_info=$(cu_eta_projection "seven_day" 24 "long" 2>/dev/null)
@@ -414,8 +367,8 @@ echo ""
 echo "=== Default Tier Based on Field ==="
 
 # Test that cu_eta_projection defaults to correct tier without explicit tier arg
-> "$CU_HISTORY_SHORT"
-> "$CU_HISTORY_LONG"
+: > "$CU_HISTORY_SHORT"
+: > "$CU_HISTORY_LONG"
 local_base=1700000000
 for i in 0 1 2 3 4; do
     ts=$((local_base + i * 3600))
@@ -435,15 +388,15 @@ assert_nonzero "seven_day defaults to short tier" "$eta_info"
 
 # Cross-check: five_hour from long tier has no data → rate=0
 eta_info=$(cu_eta_projection "five_hour" 10 "long" 2>/dev/null || true)
-read -r rate eta_hours eta_secs before_reset <<< "$eta_info"
+read -r rate _ <<< "$eta_info"
 assert_eq "five_hour from long tier → rate=0" "0" "${rate%.*}"
 
 echo ""
 echo "=== Short-to-Long Tier Fallback ==="
 
 # When short tier has no seven_day data, should fall back to long tier
-> "$CU_HISTORY_SHORT"
-> "$CU_HISTORY_LONG"
+: > "$CU_HISTORY_SHORT"
+: > "$CU_HISTORY_LONG"
 local_base=1700000000
 for i in 0 1 2 3 4; do
     ts=$((local_base + i * 3600))
@@ -463,7 +416,7 @@ echo "=== Seasonal Template ETA (seven_day hour-of-week buckets) ==="
 
 # Template needs ≥3 distinct days of long-tier data. Below that, returns
 # nothing so the caller falls back to flat-rate ETA.
-> "$CU_HISTORY_LONG"
+: > "$CU_HISTORY_LONG"
 local_base=1700000000
 # 2 days of data → insufficient
 for i in 0 1; do
@@ -478,7 +431,7 @@ assert_eq "template bails on <3 days of data" "" "$tmpl"
 # Synthetic 4-week pattern: heavy use 09:00-17:00 weekdays (each hour +1%),
 # zero elsewhere. Weekly reset Sunday midnight (drop counts as a reset, gets
 # filtered by the negative-delta rule).
-> "$CU_HISTORY_LONG"
+: > "$CU_HISTORY_LONG"
 local_base=$(date -d "2025-12-01 00:00:00" +%s 2>/dev/null || gdate -d "2025-12-01 00:00:00" +%s)
 util=0
 for d in $(seq 0 27); do
@@ -541,6 +494,4 @@ assert_eq "1d 1h" "1d 1h" "$result"
 result=$(cu_fmt_duration 300)
 assert_eq "5m" "5m" "$result"
 
-echo ""
-printf "Results: %d passed, %d failed\n" "$PASS" "$FAIL"
-[ "$FAIL" -eq 0 ]
+assert_done

@@ -1,23 +1,41 @@
 #!/usr/bin/env bash
-# history.sh - Dual-tier JSONL history: short (5-min) + long (hourly)
+# history.sh - Two-tier JSONL usage history
+#
+# Short tier: one record per 5 minutes, kept 36 hours, both windows. Feeds the
+#             burn rate and the 5h sparkline. 36h covers the largest default
+#             rate window (CU_ETA_7D_AVG=24h) with margin.
+# Long tier:  one record per hour, kept 1 year, seven_day only. Feeds the 7d
+#             sparkline and the seasonal ETA template.
+#
+# Record format: {"ts": <epoch>, "five_hour": {"util": N, "resets_at": "<iso>"}, "seven_day": {...}}
 
-# Short tier: 5-min intervals, 36h retention, both fields (fine-grained for ETA)
-# Retention covers the largest ETA avg window (CU_ETA_7D_AVG=24h) plus margin
-CU_HISTORY_SHORT="${CU_DATA_DIR}/history-short.jsonl"
-CU_SHORT_INTERVAL=300        # 5 minutes in seconds
+CU_SHORT_INTERVAL=300        # 5 minutes
 CU_SHORT_MAX_AGE=129600      # 36 hours
-
-# Long tier: hourly intervals, 1-year retention, seven_day field only
-CU_HISTORY_LONG="${CU_DATA_DIR}/history-long.jsonl"
-CU_LONG_INTERVAL=3600        # 1 hour in seconds
+CU_LONG_INTERVAL=3600        # 1 hour
 CU_LONG_MAX_AGE=31536000     # 365 days
 
 _CU_MIGRATED=""
 
-cu_tier_for_field() {
-    case "$1" in five_hour) echo short ;; *) echo long ;; esac
+cu_history_file() {
+    case "$1" in
+        short) echo "$CU_HISTORY_SHORT" ;;
+        *)     echo "$CU_HISTORY_LONG" ;;
+    esac
 }
 
+# Append LINE to FILE unless the last record falls in the same INTERVAL bucket.
+_cu_history_append() {
+    local file="$1" interval="$2" now="$3" line="$4"
+    [ -n "$line" ] || return 0
+    if [ -f "$file" ]; then
+        local last_ts
+        last_ts=$(tail -1 "$file" 2>/dev/null | tr -d '\0' | jq -r '.ts // 0' 2>/dev/null)
+        [ $(( now / interval )) = $(( ${last_ts:-0} / interval )) ] && return 0
+    fi
+    echo "$line" >> "$file"
+}
+
+# Record a cache payload (default: the cache file) into both tiers.
 cu_history_record() {
     local data="${1:-$(cu_read_cache)}"
     [ -z "$data" ] && return 1
@@ -28,96 +46,58 @@ cu_history_record() {
         _CU_MIGRATED=1
     fi
 
-    local now
+    local now short_line long_line
     now=$(cu_now)
+    short_line=$(echo "$data" | jq -c --argjson ts "$now" '
+        def rec: {util: .utilization, resets_at: (.resets_at // "")};
+        if (.five_hour or .seven_day) then
+            {ts: $ts}
+            + (if .five_hour then {five_hour: (.five_hour | rec)} else {} end)
+            + (if .seven_day then {seven_day: (.seven_day | rec)} else {} end)
+        else empty end' 2>/dev/null) || true
+    long_line=$(echo "$data" | jq -c --argjson ts "$now" '
+        if .seven_day then
+            {ts: $ts, seven_day: {util: .seven_day.utilization, resets_at: (.seven_day.resets_at // "")}}
+        else empty end' 2>/dev/null) || true
 
-    # Short tier: 5-min dedup, both fields (fine-grained data for ETA calculations)
-    local has_five_hour has_seven_day_short
-    has_five_hour=$(echo "$data" | jq -e '.five_hour' >/dev/null 2>&1 && echo 1 || echo 0)
-    has_seven_day_short=$(echo "$data" | jq -e '.seven_day' >/dev/null 2>&1 && echo 1 || echo 0)
-    if [ "$has_five_hour" = "1" ] || [ "$has_seven_day_short" = "1" ]; then
-        local short_bucket=$((now / CU_SHORT_INTERVAL))
-        local write_short=1
-        if [ -f "$CU_HISTORY_SHORT" ]; then
-            local last_ts
-            last_ts=$(tail -1 "$CU_HISTORY_SHORT" 2>/dev/null | tr -d '\0' | jq -r '.ts // 0' 2>/dev/null)
-            last_ts="${last_ts:-0}"
-            local last_bucket=$((last_ts / CU_SHORT_INTERVAL))
-            [ "$short_bucket" = "$last_bucket" ] && write_short=0
-        fi
-        if [ "$write_short" = "1" ]; then
-            local short_line
-            short_line=$(echo "$data" | jq -c --argjson ts "$now" \
-                '{ts: $ts}
-                + (if .five_hour then {five_hour: {util: .five_hour.utilization, resets_at: (.five_hour.resets_at // "")}} else {} end)
-                + (if .seven_day then {seven_day: {util: .seven_day.utilization, resets_at: (.seven_day.resets_at // "")}} else {} end)' \
-                2>/dev/null) || true
-            [ -n "$short_line" ] && echo "$short_line" >> "$CU_HISTORY_SHORT"
-        fi
-    fi
+    _cu_history_append "$CU_HISTORY_SHORT" "$CU_SHORT_INTERVAL" "$now" "$short_line"
+    _cu_history_append "$CU_HISTORY_LONG" "$CU_LONG_INTERVAL" "$now" "$long_line"
+}
 
-    # Long tier: hourly dedup, seven_day field only
-    local has_seven_day
-    has_seven_day=$(echo "$data" | jq -e '.seven_day' >/dev/null 2>&1 && echo 1 || echo 0)
-    if [ "$has_seven_day" = "1" ]; then
-        local long_bucket=$((now / CU_LONG_INTERVAL))
-        local write_long=1
-        if [ -f "$CU_HISTORY_LONG" ]; then
-            local last_ts
-            last_ts=$(tail -1 "$CU_HISTORY_LONG" 2>/dev/null | tr -d '\0' | jq -r '.ts // 0' 2>/dev/null)
-            last_ts="${last_ts:-0}"
-            local last_bucket=$((last_ts / CU_LONG_INTERVAL))
-            [ "$long_bucket" = "$last_bucket" ] && write_long=0
-        fi
-        if [ "$write_long" = "1" ]; then
-            local long_line
-            long_line=$(echo "$data" | jq -c --argjson ts "$now" \
-                '{ts: $ts, seven_day: {util: .seven_day.utilization, resets_at: (.seven_day.resets_at // "")}}' \
-                2>/dev/null) || true
-            [ -n "$long_line" ] && echo "$long_line" >> "$CU_HISTORY_LONG"
-        fi
+# Refresh the cache (unless --no-fetch) and record it into history.
+cu_fetch_and_record() {
+    [ "${CU_OPT_NO_FETCH:-}" = "1" ] && return 0
+    cu_fetch || return 1
+    local data
+    data=$(cu_read_cache)
+    [ -n "$data" ] && cu_history_record "$data"
+    return 0
+}
+
+# Drop records older than MAX_AGE from FILE; skips unparseable lines.
+_cu_history_prune_file() {
+    local file="$1" max_age="$2"
+    [ -f "$file" ] || return 0
+    local tmp="${file}.tmp"
+    if jq -R -c --argjson cutoff "$(( $(cu_now) - max_age ))" \
+        'fromjson? | select(.ts >= $cutoff)' "$file" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$file"
+    else
+        rm -f "$tmp"
     fi
 }
 
 cu_history_prune() {
-    local now
-    now=$(cu_now)
-
-    # Prune short tier (24h)
-    if [ -f "$CU_HISTORY_SHORT" ]; then
-        local cutoff=$((now - CU_SHORT_MAX_AGE))
-        local tmp="${CU_HISTORY_SHORT}.tmp"
-        if jq -R -c --argjson cutoff "$cutoff" 'fromjson? | select(.ts >= $cutoff)' "$CU_HISTORY_SHORT" > "$tmp" 2>/dev/null; then
-            mv "$tmp" "$CU_HISTORY_SHORT"
-        else
-            rm -f "$tmp"
-        fi
-    fi
-
-    # Prune long tier (1 year)
-    if [ -f "$CU_HISTORY_LONG" ]; then
-        local cutoff=$((now - CU_LONG_MAX_AGE))
-        local tmp="${CU_HISTORY_LONG}.tmp"
-        if jq -R -c --argjson cutoff "$cutoff" 'fromjson? | select(.ts >= $cutoff)' "$CU_HISTORY_LONG" > "$tmp" 2>/dev/null; then
-            mv "$tmp" "$CU_HISTORY_LONG"
-        else
-            rm -f "$tmp"
-        fi
-    fi
+    _cu_history_prune_file "$CU_HISTORY_SHORT" "$CU_SHORT_MAX_AGE"
+    _cu_history_prune_file "$CU_HISTORY_LONG" "$CU_LONG_MAX_AGE"
 }
 
+# Print the records of TIER from the last HOURS hours, one JSON object per line.
 cu_history_read() {
     local tier="${1:-long}" hours="${2:-168}"
-    local now cutoff file
-    now=$(cu_now)
-    cutoff=$((now - hours * 3600))
-
-    case "$tier" in
-        short) file="$CU_HISTORY_SHORT" ;;
-        long)  file="$CU_HISTORY_LONG" ;;
-        *)     file="$CU_HISTORY_LONG" ;;
-    esac
-
+    local file cutoff
+    file=$(cu_history_file "$tier")
+    cutoff=$(( $(cu_now) - hours * 3600 ))
     [ -f "$file" ] || return 0
     jq -R -c --argjson cutoff "$cutoff" 'fromjson? | select(.ts >= $cutoff)' "$file" 2>/dev/null
 }
@@ -127,28 +107,9 @@ cu_history_values() {
     cu_history_read "$tier" "$hours" | jq -r ".$field.util" 2>/dev/null
 }
 
-cu_history_deltas() {
-    # Output per-interval deltas (rate of change) instead of absolute values
-    # Negative deltas (resets) are clamped to 0
-    local tier="${1:-long}" field="${2:-seven_day}" hours="${3:-168}"
-    local prev="" val=""
-    while IFS= read -r val; do
-        [ -z "$val" ] && continue
-        if [ -n "$prev" ]; then
-            local prev_int="${prev%.*}" val_int="${val%.*}"
-            prev_int="${prev_int:-0}"; val_int="${val_int:-0}"
-            local delta=$((val_int - prev_int))
-            # Clamp negative deltas (resets) to 0
-            [ "$delta" -lt 0 ] 2>/dev/null && delta=0
-            echo "$delta"
-        fi
-        prev="$val"
-    done < <(cu_history_values "$tier" "$field" "$hours")
-}
-
 cu_history_dump() {
     if [ -f "$CU_HISTORY_SHORT" ]; then
-        echo "=== Short tier (5-min, 24h) ==="
+        echo "=== Short tier (5-min, 36h) ==="
         cat "$CU_HISTORY_SHORT"
     fi
     if [ -f "$CU_HISTORY_LONG" ]; then
@@ -163,9 +124,7 @@ cu_history_migrate() {
     if [ -f "$old_file" ] && [ ! -f "${old_file}.bak" ] \
        && [ ! -f "$CU_HISTORY_SHORT" ] && [ ! -f "$CU_HISTORY_LONG" ]; then
 
-        local now
-        now=$(cu_now)
-        local short_cutoff=$((now - CU_SHORT_MAX_AGE))
+        local short_cutoff=$(( $(cu_now) - CU_SHORT_MAX_AGE ))
 
         # Migrate recent → short (both fields), all → long (seven_day only)
         jq -c --argjson cutoff "$short_cutoff" \
@@ -194,15 +153,14 @@ _cu_migrate_short_seven_day() {
         return 0
     fi
 
-    # Read long tier into sorted arrays of (ts, util) for interpolation
-    # Then enrich each short tier record with an interpolated seven_day value
+    # Enrich each short-tier record with a seven_day value interpolated
+    # linearly between the surrounding long-tier records.
     local tmp="${CU_HISTORY_SHORT}.mig"
     jq -c --slurpfile long <(jq -c '{ts, util: .seven_day.util}' "$CU_HISTORY_LONG" 2>/dev/null) '
         . as $rec |
         ($long | sort_by(.ts)) as $pts |
         if ($pts | length) < 1 then $rec
         else
-            # Find surrounding long-tier points and linearly interpolate
             ($rec.ts) as $t |
             ([$pts[] | select(.ts <= $t)] | last // null) as $lo |
             ([$pts[] | select(.ts > $t)] | first // null) as $hi |

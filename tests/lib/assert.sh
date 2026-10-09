@@ -71,6 +71,13 @@ assert_status() {
     assert_eq "$desc" "$expected" "$status"
 }
 
+# Write an executable mock script from stdin, with this bash as interpreter
+# (a #! line in the input is dropped; /usr/bin/env may not exist).
+make_mock() {
+    { echo "#!$BASH"; grep -v '^#!'; } > "$1"
+    chmod +x "$1"
+}
+
 # Strip ANSI color sequences
 strip_ansi() {
     sed 's/\x1b\[[0-9;]*m//g'

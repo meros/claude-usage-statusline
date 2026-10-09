@@ -1,40 +1,37 @@
 #!/usr/bin/env bash
-# run-tests.sh - Test runner
+# run-tests.sh - Run every tests/test-*.sh suite
+#
+# Usage: bash tests/run-tests.sh [suite-name ...]   e.g. run-tests.sh fetch cli
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export TZ=Europe/Stockholm  # snapshots and pace tests use local time
 
-TOTAL_PASS=0
-TOTAL_FAIL=0
-SUITES=0
-FAILED_SUITES=()
+suites=()
+if [ $# -gt 0 ]; then
+    for name in "$@"; do suites+=("${SCRIPT_DIR}/test-${name}.sh"); done
+else
+    suites=("${SCRIPT_DIR}"/test-*.sh)
+fi
 
-run_suite() {
-    local name="$1" script="$2"
+failed=()
+for suite in "${suites[@]}"; do
+    name=$(basename "$suite" .sh)
     echo ""
-    echo "━━━ $name ━━━"
-    SUITES=$((SUITES + 1))
-    if bash "$script"; then
+    echo "━━━ ${name#test-} ━━━"
+    if bash "$suite"; then
         echo "  ✓ Suite passed"
     else
         echo "  ✗ Suite FAILED"
-        FAILED_SUITES+=("$name")
+        failed+=("${name#test-}")
     fi
-}
-
-run_suite "Render Tests" "${SCRIPT_DIR}/test-render.sh"
-run_suite "History Tests" "${SCRIPT_DIR}/test-history.sh"
-run_suite "ETA Tests" "${SCRIPT_DIR}/test-eta.sh"
-run_suite "Fetch Tests" "${SCRIPT_DIR}/test-fetch.sh"
-run_suite "Pacing Tests" "${SCRIPT_DIR}/test-pace.sh"
+done
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Suites: $SUITES total, ${#FAILED_SUITES[@]} failed"
-
-if [ ${#FAILED_SUITES[@]} -gt 0 ]; then
-    echo "Failed: ${FAILED_SUITES[*]}"
+echo "Suites: ${#suites[@]} total, ${#failed[@]} failed"
+if [ ${#failed[@]} -gt 0 ]; then
+    echo "Failed: ${failed[*]}"
     exit 1
-else
-    echo "All suites passed!"
 fi
+echo "All suites passed!"
