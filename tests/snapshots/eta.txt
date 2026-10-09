@@ -1,0 +1,8 @@
+5-Hour Window
+  Rate: +9.5000%/hour
+  ETA to 100%: ~7h 24m
+
+7-Day Window
+  Rate: +0.7792%/hour
+  ETA to 100%: ~1d 15h
+  [38;2;251;73;52mWARNING: Projected to hit limit BEFORE reset[0m

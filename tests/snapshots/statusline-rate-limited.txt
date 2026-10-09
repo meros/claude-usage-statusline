@@ -1,0 +1,2 @@
+[38;2;131;165;152mmyproject[0m [38;2;142;192;124m main[0m
+[38;2;146;131;116mAPI rate limited, retry in 5m[0m
