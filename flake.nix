@@ -73,14 +73,14 @@
           shellcheck = pkgs.runCommand "claude-usage-shellcheck"
             { nativeBuildInputs = [ pkgs.shellcheck ]; } ''
             cd ${./.}
-            shellcheck -x bin/claude-usage install.sh tests/*.sh tests/lib/*.sh
+            shellcheck -x bin/claude-usage install.sh scripts/*.sh tests/*.sh tests/lib/*.sh
             shellcheck -x -e SC2034,SC2154 lib/*.sh views/*.sh
             touch $out
           '';
         };
 
         devShells.default = pkgs.mkShell {
-          packages = runtimeDeps ++ (with pkgs; [ shellcheck charm-freeze ]);
+          packages = runtimeDeps ++ [ pkgs.shellcheck ];
         };
       }
     ) // {

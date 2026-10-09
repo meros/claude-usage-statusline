@@ -11,7 +11,7 @@ echo ""
 
 # Check dependencies
 missing=()
-for cmd in jq curl awk; do
+for cmd in git jq curl awk; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
 done
 

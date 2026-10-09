@@ -45,15 +45,16 @@ _cu_spark_scale() {
     echo "$max"
 }
 
-# Level 0..LEVELS of a value, clamped to [0, CU_SPARK_MAX] and scaled to SCALE.
+# Level 0..LEVELS of a value, clamped to [0, CU_SPARK_MAX] and scaled to
+# SCALE, into _spark_level (a variable, not output: no subshell per value).
 _cu_spark_level() {
-    local v="${1%.*}" scale="$2" levels="$3"
+    local v="${1%.*}" scale="$2" levels="$3" max="${CU_SPARK_MAX:-100}"
     v="${v:-0}"
     [ "$v" -lt 0 ] 2>/dev/null && v=0
-    [ "$v" -gt "${CU_SPARK_MAX:-100}" ] 2>/dev/null && v="${CU_SPARK_MAX:-100}"
-    local level=$(( (v * levels) / scale ))
-    [ "$level" -gt "$levels" ] && level="$levels"
-    echo "$level"
+    [ "$v" -gt "$max" ] 2>/dev/null && v="$max"
+    _spark_level=$(( (v * levels) / scale ))
+    [ "$_spark_level" -gt "$levels" ] && _spark_level="$levels"
+    return 0
 }
 
 # Block sparkline (▁▂▃▄▅▆▇█), one character per value. With more values than
@@ -69,7 +70,8 @@ cu_sparkline() {
     local scale i written=0
     scale=$(_cu_spark_scale "$step")
     for ((i = 0; i < count && written < width; i += step)); do
-        printf '%s' "${CU_SPARK_BLOCKS[$(_cu_spark_level "${_spark_values[$i]}" "$scale" 7)]}"
+        _cu_spark_level "${_spark_values[$i]}" "$scale" 7
+        printf '%s' "${CU_SPARK_BLOCKS[$_spark_level]}"
         written=$((written + 1))
     done
 }
@@ -89,16 +91,21 @@ cu_braille_sparkline() {
         case "$resets" in
             *" $i "*|*" $((i + 1)) "*) printf '↻'; continue ;;
         esac
-        left=$(_cu_spark_level "${_spark_values[$i]}" "$scale" 4)
+        _cu_spark_level "${_spark_values[$i]}" "$scale" 4
+        left=$_spark_level
         right=0
-        [ $((i + 1)) -lt "$count" ] && right=$(_cu_spark_level "${_spark_values[$((i + 1))]}" "$scale" 4)
+        if [ $((i + 1)) -lt "$count" ]; then
+            _cu_spark_level "${_spark_values[$((i + 1))]}" "$scale" 4
+            right=$_spark_level
+        fi
         _cu_braille_char $(( _CU_BRAILLE_LEFT[left] + _CU_BRAILLE_RIGHT[right] ))
     done
 }
 
 # Sparkline of usage growth per time slot for FIELD over the last HOURS.
 # Args: field, hours, width (characters), mode (braille|block), tier
-# Each slot shows how much utilization grew in it; drops (resets) count as 0.
+# Each slot shows how much utilization grew in it (in tenths of a point);
+# drops (resets) count as 0.
 # In braille mode a ↻ marks the slot where the window reset.
 cu_sparkline_from_history() {
     local field="${1:-seven_day}" hours="${2:-168}" width="${3:-40}"
@@ -163,7 +170,8 @@ cu_sparkline_from_history() {
                 s0 = win_start + i * slot_secs
                 v_s = interp(s0)
                 v_e = interp(s0 + slot_secs)
-                d = (v_s >= 0 && v_e >= 0) ? int(v_e - v_s) : 0
+                # Tenths of a point: whole points would round small steps to 0.
+                d = (v_s >= 0 && v_e >= 0) ? int((v_e - v_s) * 10) : 0
                 printf "%s%d", (i > 0 ? " " : ""), (d < 0 ? 0 : d)
             }
             printf "\n"
@@ -180,9 +188,9 @@ cu_sparkline_from_history() {
     [ ${#deltas[@]} -eq 0 ] && return
 
     if [ "$mode" = "braille" ]; then
-        CU_SPARK_RESETS="$reset_line" cu_braille_sparkline "${deltas[@]}"
+        CU_SPARK_MAX=1000 CU_SPARK_RESETS="$reset_line" cu_braille_sparkline "${deltas[@]}"
     else
-        CU_OPT_WIDTH="$width" cu_sparkline "${deltas[@]}"
+        CU_SPARK_MAX=1000 CU_OPT_WIDTH="$width" cu_sparkline "${deltas[@]}"
     fi
 }
 

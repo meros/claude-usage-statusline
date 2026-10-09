@@ -22,8 +22,10 @@ cu_view_history() {
     if [ -f "$CU_HISTORY_LONG" ]; then
         local long_hours="${CU_OPT_HOURS:-168}"
         [ -f "$CU_HISTORY_SHORT" ] && echo ""
-        printf "%s━━━ History (hourly, last %sd) ━━━%s\n" \
-            "$(cu_color "$CU_FG")" "$((long_hours / 24))" "$(cu_reset)"
+        local span="${long_hours}h"
+        [ "$long_hours" -ge 48 ] && span="$((long_hours / 24))d"
+        printf "%s━━━ History (hourly, last %s) ━━━%s\n" \
+            "$(cu_color "$CU_FG")" "$span" "$(cu_reset)"
         _cu_history_table long "$long_hours"
         _cu_history_burn "7d" seven_day "$long_hours" long
     fi

@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Shellcheck
         run: |
-          shellcheck -x bin/claude-usage install.sh tests/*.sh tests/lib/*.sh
+          shellcheck -x bin/claude-usage install.sh scripts/*.sh tests/*.sh tests/lib/*.sh
           shellcheck -x -e SC2034,SC2154 lib/*.sh views/*.sh
       - name: Tests
         run: bash tests/run-tests.sh

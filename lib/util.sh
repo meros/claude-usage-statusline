@@ -151,9 +151,16 @@ cu_fmt_eta_date() {
 }
 
 # Visible length of a string: characters after stripping ANSI color codes.
-# Counts UTF-8 lead bytes, so the result does not depend on the locale.
+# Pure bash (no fork; the statusline measures every cell). Counts UTF-8 lead
+# bytes in the C locale, so the result does not depend on the user's locale.
 cu_visible_len() {
-    printf '%s' "$1" | LC_ALL=C sed 's/\x1b\[[0-9;]*m//g' | LC_ALL=C tr -d '\200-\277' | wc -c | tr -d ' '
+    local s="$1" re=$'\e\\[[0-9;]*m'
+    while [[ "$s" =~ $re ]]; do
+        s="${s/"${BASH_REMATCH[0]}"/}"
+    done
+    local LC_ALL=C
+    s="${s//[$'\x80'-$'\xbf']/}"
+    echo "${#s}"
 }
 
 # Split a comma-separated list into words: "a,b" -> "a b"
