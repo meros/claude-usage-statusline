@@ -89,32 +89,94 @@ unset CU_PACE_CONTRACT_PATH
 echo ""
 echo "=== Formatting and Rendering Tests ==="
 
-# Test overshoot formatting
-_CU_PACE_OVERSHOOT="0.0"
+# Test overshoot formatting (the value comes in tenths of a point)
+_CU_PACE_O10=0
 _CU_PACE_COLOR=""
-assert_eq "overshoot 0.0 formats as ±0% on curve" "±0% on curve" "$(cu_pace_fmt_overshoot)"
+assert_eq "overshoot 0.0 formats as ±0 pts on curve" "±0 pts on curve" "$(cu_pace_fmt_overshoot)"
 
-_CU_PACE_OVERSHOOT="12.4"
-assert_eq "overshoot +12.4 formats as +12% over" "+12% over" "$(cu_pace_fmt_overshoot)"
+_CU_PACE_O10=124
+assert_eq "overshoot +12.4 formats as +12 pts over" "+12 pts over" "$(cu_pace_fmt_overshoot)"
 
-_CU_PACE_OVERSHOOT="-5.6"
-assert_eq "overshoot -5.6 formats as -6% under" "-6% under" "$(cu_pace_fmt_overshoot)"
+_CU_PACE_O10=-56
+assert_eq "overshoot -5.6 formats as -6 pts under" "-6 pts under" "$(cu_pace_fmt_overshoot)"
+
+_CU_PACE_O10=9
+assert_eq "overshoot +0.9 is still on curve" "±0 pts on curve" "$(cu_pace_fmt_overshoot)"
 
 # Test suppression in pace load
 CU_NO_LIMITS=1 cu_pace_load "50" "$RESET_TS" && res=0 || res=1
 assert_eq "cu_pace_load bails when CU_NO_LIMITS=1" 1 "$res"
 
-# Test multiline rendering format
+# Test multiline rendering format. CU_NOW is Tue 16:00 (target 40%).
 export CU_NOW=1778594400
 export ANTHROPIC_BASE_URL=""
 export CU_NO_LIMITS=""
-out=$(cu_pace_render_multiline "40" "$RESET_TS")
-clean_out=$(echo "$out" | sed 's/\x1b\[[0-9;]*m//g' | tr -d '\n')
-echo "$clean_out" | grep -q "pa ░░░░░░░░░░  ±0% on curve" && has_pa=1 || has_pa=0
-assert_eq "cu_pace_render_multiline output matches expected format" 1 "$has_pa"
+strip() { sed 's/\x1b\[[0-9;]*m//g' | tr -d '\n'; }
+
+cu_pace_load "40" "$RESET_TS"
+assert_eq "auto row is hidden on the curve" "" "$(cu_pace_render_multiline "")"
+clean_out=$(CU_PACE_ROW=1 cu_pace_render_multiline "" | strip)
+assert_eq "CU_PACE_ROW=1 shows the row on the curve" "pa ░░░░░░░░░░  ±0 pts on curve" "$clean_out"
+assert_eq "CU_PACE_ROW=0 hides the row" "" "$(CU_PACE_ROW=0 cu_pace_render_multiline "")"
+
+cu_pace_load "45" "$RESET_TS"
+clean_out=$(cu_pace_render_multiline "" | strip)
+assert_eq "auto row shows when over the curve" "pa █░░░░░░░░░  +5 pts over" "$clean_out"
+clean_out=$(cu_pace_render_inline "" | strip)
+assert_eq "inline segment" " | pace: +5 pts over" "$clean_out"
 
 # Verify no pacing mechanism strings appear
 echo "$clean_out" | grep -qE "pacing off|throttle|blocking" && has_mech=1 || has_mech=0
 assert_eq "no pacing mechanism states in output" 0 "$has_mech"
+
+echo ""
+echo "=== Level (warn, crit) and Projection ==="
+
+cu_pace_load "40" "$RESET_TS";   assert_eq "on the curve is ok" "ok" "$_CU_PACE_LEVEL"
+cu_pace_load "40.5" "$RESET_TS"; assert_eq "under 1 point over is ok" "ok" "$_CU_PACE_LEVEL"
+cu_pace_load "45" "$RESET_TS";   assert_eq "5 points over is warn" "warn" "$_CU_PACE_LEVEL"
+cu_pace_load "50" "$RESET_TS";   assert_eq "10 points over is warn" "warn" "$_CU_PACE_LEVEL"
+cu_pace_load "51" "$RESET_TS";   assert_eq "11 points over is crit" "crit" "$_CU_PACE_LEVEL"
+cu_pace_load "45" "$RESET_TS" 1; assert_eq "5 points over with a projected cap hit is crit" "crit" "$_CU_PACE_LEVEL"
+cu_pace_load "30" "$RESET_TS" 1; assert_eq "under the curve stays ok with a projected hit" "ok" "$_CU_PACE_LEVEL"
+cu_pace_load "45" "$RESET_TS";   cu_pace_classify 1
+assert_eq "classify later raises the level" "crit" "$_CU_PACE_LEVEL"
+
+echo ""
+echo "=== Model Hint ==="
+
+OPUS="claude-opus-5-5 Opus 5.5"
+SONNET="claude-sonnet-5-5 Sonnet 5.5"
+cu_pace_load "60" "$RESET_TS"   # 20 points over: crit
+assert_eq "heavy model over the curve warns" "⚠ opus: try sonnet" "$(cu_pace_model_hint "$OPUS")"
+assert_eq "light model gets no hint" "" "$(cu_pace_model_hint "$SONNET")"
+assert_eq "unknown model gets no hint" "" "$(cu_pace_model_hint " ")"
+assert_eq "hint off" "" "$(CU_PACE_MODEL_HINT=0 cu_pace_model_hint "$OPUS")"
+assert_eq "heavy list is configurable" "⚠ sonnet: try haiku" \
+    "$(CU_PACE_HEAVY_MODELS=sonnet CU_PACE_LIGHT_MODEL=haiku cu_pace_model_hint "$SONNET")"
+assert_eq "display name matches too" "⚠ fable: try sonnet" "$(cu_pace_model_hint "x Fable 5.1")"
+cu_pace_load "45" "$RESET_TS"   # 5 points over: warn
+assert_eq "mild overshoot on a heavy model is a dim hint" "→ sonnet" "$(cu_pace_model_hint "$OPUS")"
+cu_pace_load "40" "$RESET_TS"
+assert_eq "no hint on the curve" "" "$(cu_pace_model_hint "$OPUS")"
+cu_pace_load "60" "$RESET_TS"
+clean_out=$(cu_pace_render_multiline "$OPUS" | strip)
+assert_eq "hint shows in the row" "pa ██████░░░░  +20 pts over ⚠ opus: try sonnet" "$clean_out"
+cu_pace_load "40" "$RESET_TS"
+assert_eq "no hint row on the curve in auto mode" "" "$(cu_pace_render_multiline "$OPUS")"
+
+echo ""
+echo "=== Target Max and Off Dates ==="
+
+# Tue 16:00: 40% of the week has passed.
+CU_PACE_TARGET_MAX=90 cu_pace_load "0" "$RESET_TS"
+assert_eq "target max 90 scales the curve" "36" "$_CU_PACE_TARGET"
+CU_NOW=1778853600 CU_PACE_TARGET_MAX=90 cu_pace_load "0" "$RESET_TS"
+assert_eq "the curve ends at target max" "90" "$_CU_PACE_TARGET"
+# Wed 2026-05-13 is off: the week has 36 work hours and 18 have passed by Tue 16:00.
+CU_PACE_OFF_DATES="2026-05-13" cu_pace_load "0" "$RESET_TS"
+assert_eq "an off day removes its hours from the week" "50" "$_CU_PACE_TARGET"
+CU_PACE_OFF_DATES="2026-05-11,2026-05-12,2026-05-13,2026-05-14,2026-05-15" cu_pace_load "0" "$RESET_TS" && res=0 || res=1
+assert_eq "a week of off days has no curve" "1" "$res"
 
 assert_done

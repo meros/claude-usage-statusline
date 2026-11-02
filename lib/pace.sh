@@ -12,7 +12,15 @@
 #   CU_PACE_ENABLED     1 (default) or 0
 #   CU_PACE_WORK_DAYS   days that count, e.g. "mon-fri", "mon,tue,thu", "1-5" (1 = Monday)
 #   CU_PACE_WORK_HOURS  local hours that count, start-end, end exclusive: "07-16"
-#   CU_PACE_BAR_SCALE   overshoot (points) that fills the bar (default 30)
+#   CU_PACE_BAR_SCALE   overshoot (points) that fills the pacing row bar (default 30)
+#   CU_PACE_TARGET_MAX  usage (percent) the curve reaches at the reset (default 100;
+#                       90 leaves a safety margin)
+#   CU_PACE_OFF_DATES   days off, "2026-12-24,2026-12-25"; they hold no work hours
+#   CU_PACE_ROW         auto (default): show the pace row only when over the curve
+#                       or when a model hint applies; 1 always; 0 never
+#   CU_PACE_MODEL_HINT  1 (default) or 0. Warns when a heavy model runs over the curve
+#   CU_PACE_HEAVY_MODELS  words that mark a heavy model in its id (default "opus fable")
+#   CU_PACE_LIGHT_MODEL   the model to suggest instead (default "sonnet")
 #   CU_PACE_CONTRACT_PATH, CU_PACE_STALE_SECONDS
 #                       JSON from an external pacer ({"util", "target", "updated_at"}),
 #                       read only when no usage data is available
@@ -21,6 +29,12 @@ CU_PACE_ENABLED="${CU_PACE_ENABLED:-1}"
 CU_PACE_WORK_DAYS="${CU_PACE_WORK_DAYS:-mon-fri}"
 CU_PACE_WORK_HOURS="${CU_PACE_WORK_HOURS:-07-16}"
 CU_PACE_BAR_SCALE="${CU_PACE_BAR_SCALE:-${CU_PACE_DENY_THRESHOLD:-30}}"
+CU_PACE_TARGET_MAX="${CU_PACE_TARGET_MAX:-100}"
+CU_PACE_OFF_DATES="${CU_PACE_OFF_DATES:-}"
+CU_PACE_ROW="${CU_PACE_ROW:-auto}"
+CU_PACE_MODEL_HINT="${CU_PACE_MODEL_HINT:-1}"
+CU_PACE_HEAVY_MODELS="${CU_PACE_HEAVY_MODELS:-opus fable}"
+CU_PACE_LIGHT_MODEL="${CU_PACE_LIGHT_MODEL:-sonnet}"
 CU_PACE_CONTRACT_PATH="${CU_PACE_CONTRACT_PATH:-$HOME/.cache/claude-pacing/statusline.json}"
 CU_PACE_STALE_SECONDS="${CU_PACE_STALE_SECONDS:-120}"
 
@@ -61,40 +75,54 @@ cu_pace_work_days() {
     echo "[$out]"
 }
 
-# Target utilization (0-100) at NOW for a window that resets at RESET_EPOCH.
+# Target utilization (0-CU_PACE_TARGET_MAX) at NOW for a window that resets at
+# RESET_EPOCH. The window is the 7 days before the reset; the target is the
+# share of its work hours that have passed. Off dates hold no work hours.
 cu_pace_target() {
-    local now="$1" reset_epoch="$2" days start end
+    local now="$1" reset_epoch="$2" days start end max off=""
     days=$(cu_pace_work_days "$CU_PACE_WORK_DAYS") || return 1
     start=$((10#${CU_PACE_WORK_HOURS%%-*}))
     end=$((10#${CU_PACE_WORK_HOURS#*-}))
     [ "$end" -gt "$start" ] || return 1
+    max="$CU_PACE_TARGET_MAX"
+    [[ "$max" =~ ^[0-9]+$ ]] || max=100
+    local item
+    for item in $(cu_words "${CU_PACE_OFF_DATES//,/ }"); do off+="${off:+,}\"$item\""; done
 
-    jq -n --argjson now "$now" --argjson reset "$reset_epoch" \
-        --argjson days "$days" --argjson start "$start" --argjson end "$end" '
+    jq -n --argjson now "$now" --argjson reset "$reset_epoch" --argjson max "$max" \
+        --argjson days "$days" --argjson start "$start" --argjson end "$end" \
+        --argjson off "[${off}]" '
         def is_work: localtime as $lt
-            | ($days | index($lt[6])) != null and $lt[3] >= $start and $lt[3] < $end;
-        (($days | unique | length) * ($end - $start)) as $per_week |
+            | ($days | index($lt[6])) != null and $lt[3] >= $start and $lt[3] < $end
+              and ($off | index($lt | strftime("%Y-%m-%d"))) == null;
+        ([range($reset - 604800; $reset; 3600) | select(is_work)] | length) as $total |
         (if $reset <= $now then 0
          else [range($now; $reset; 3600) | select(is_work)] | length end) as $left |
-        ([0, (1 - $left / $per_week)] | max | [1, .] | min * 100) | round
+        if $total == 0 then error("no work hours") else
+        ([0, (1 - $left / $total)] | max | [1, .] | min * $max) | round end
     ' 2>/dev/null
 }
 
 # Compute the pacing metric into _CU_PACE_* globals:
-#   _CU_PACE_UTIL, _CU_PACE_TARGET, _CU_PACE_OVERSHOOT (points), _CU_PACE_COLOR
-# Args: seven_day utilization, seven_day reset (ISO or epoch). Without them it
-# reads the cache, then the external contract file.
+#   _CU_PACE_UTIL, _CU_PACE_TARGET, _CU_PACE_OVERSHOOT (points),
+#   _CU_PACE_O10 (overshoot in tenths of a point, rounded), _CU_PACE_LEVEL
+#   (ok|warn|crit) and _CU_PACE_COLOR
+# Args: seven_day utilization, seven_day reset (ISO or epoch), and optionally
+# the 7d projection flag (1 = the cap is reached before the reset). Without
+# util and reset it reads the cache, then the external contract file.
 # Returns non-zero when there is nothing to show.
 cu_pace_load() {
     _CU_PACE_UTIL=""
     _CU_PACE_TARGET=""
     _CU_PACE_OVERSHOOT=""
+    _CU_PACE_O10=""
+    _CU_PACE_LEVEL=""
     _CU_PACE_COLOR=""
 
     [ "${CU_PACE_ENABLED:-1}" = "1" ] || return 1
     cu_limits_disabled && return 1
 
-    local util="${1:-}" reset_val="${2:-}"
+    local util="${1:-}" reset_val="${2:-}" hit="${3:-}"
     if [ -z "$util" ] || [ -z "$reset_val" ]; then
         local cache_data
         cache_data=$(cu_read_cache 2>/dev/null)
@@ -126,48 +154,103 @@ cu_pace_load() {
         return 1
     fi
 
-    _CU_PACE_OVERSHOOT=$(awk -v u="$_CU_PACE_UTIL" -v t="$_CU_PACE_TARGET" 'BEGIN { printf "%.1f", u - t }')
-    # On or under the curve: green; up to 10 points over: yellow; more: red.
-    _CU_PACE_COLOR=$(awk -v o="$_CU_PACE_OVERSHOOT" \
-        -v g="$CU_GREEN" -v y="$CU_YELLOW" -v r="$CU_RED" '
-        BEGIN { print (o <= 0) ? g : (o <= 10) ? y : r }')
+    local calc
+    calc=$(awk -v u="$_CU_PACE_UTIL" -v t="$_CU_PACE_TARGET" 'BEGIN {
+        o = u - t; printf "%.1f %d", o, (o < 0 ? o * 10 - 0.5 : o * 10 + 0.5) }')
+    read -r _CU_PACE_OVERSHOOT _CU_PACE_O10 <<< "$calc"
+    cu_pace_classify "$hit"
     return 0
 }
 
-# "+12% over", "-6% under" or "±0% on curve" (within 1 point), colored.
+# Set _CU_PACE_LEVEL and _CU_PACE_COLOR from the loaded overshoot. HIT is 1
+# when the 7d projection reaches the cap before the reset.
+#   ok:   under the curve, or less than 1 point over
+#   crit: more than 10 points over, or any overshoot with a projected cap hit
+#   warn: 1 to 10 points over
+cu_pace_classify() {
+    local hit="${1:-}" o10="${_CU_PACE_O10:-0}"
+    if [ "$o10" -lt 10 ]; then
+        _CU_PACE_LEVEL="ok"; _CU_PACE_COLOR="$CU_GREEN"
+    elif [ "$o10" -gt 100 ] || [ "$hit" = "1" ]; then
+        _CU_PACE_LEVEL="crit"; _CU_PACE_COLOR="$CU_RED"
+    else
+        _CU_PACE_LEVEL="warn"; _CU_PACE_COLOR="$CU_YELLOW"
+    fi
+}
+
+# "+12 pts over", "-6 pts under" or "±0 pts on curve" (within 1 point), colored.
 cu_pace_fmt_overshoot() {
-    local phrase
-    phrase=$(awk -v v="$_CU_PACE_OVERSHOOT" 'BEGIN {
-        a = (v < 0 ? -v : v);
-        if (a < 1.0) { printf "±0%% on curve" }
-        else if (v >= 0) { printf "+%.0f%% over", v }
-        else { printf "-%.0f%% under", a }
-    }')
+    local o10="${_CU_PACE_O10:-0}" abs phrase
+    abs=$(( o10 < 0 ? -o10 : o10 ))
+    if [ "$abs" -lt 10 ]; then phrase="±0 pts on curve"
+    elif [ "$o10" -gt 0 ]; then phrase="+$(( (abs + 5) / 10 )) pts over"
+    else phrase="-$(( (abs + 5) / 10 )) pts under"
+    fi
     printf "%s%s%s" "$(cu_color "${_CU_PACE_COLOR:-$CU_GREEN}")" "$phrase" "$(cu_reset)"
 }
 
 # Overshoot as a bar: empty on or under the curve, full at CU_PACE_BAR_SCALE points over.
 cu_pace_bar() {
-    local pct
-    pct=$(awk -v o="$_CU_PACE_OVERSHOOT" -v d="$CU_PACE_BAR_SCALE" \
-        'BEGIN { v = (o < 0 ? 0 : o); p = (v * 100) / d; if (p > 100) p = 100; printf "%d", p }')
+    local scale="${CU_PACE_BAR_SCALE%.*}" o10="${_CU_PACE_O10:-0}" pct
+    [[ "$scale" =~ ^[0-9]+$ ]] && [ "$scale" -gt 0 ] || scale=30
+    [ "$o10" -lt 0 ] && o10=0
+    pct=$(( o10 * 10 / scale ))
+    [ "$pct" -gt 100 ] && pct=100
     cu_progress_bar "$pct" "${CU_BAR_WIDTH:-10}" "${_CU_PACE_COLOR:-$CU_GREEN}"
 }
 
-# Single-line segment: " | pace: <overshoot>", nothing when not available.
+# The heavy-model word in MODEL (an id or display name), or nothing.
+_cu_pace_heavy_word() {
+    local model="${1,,}" word
+    for word in $(cu_words "${CU_PACE_HEAVY_MODELS,,}"); do
+        [[ "$model" == *"$word"* ]] && { printf '%s' "$word"; return 0; }
+    done
+    return 0
+}
+
+# Advice for the running model MODEL (id and display name joined by a space):
+#   crit on a heavy model: "⚠ opus: try sonnet" (colored)
+#   warn on a heavy model: "→ sonnet" (dim)
+# Nothing on or under the curve, on a light model, or without a model.
+cu_pace_model_hint() {
+    [ "${CU_PACE_MODEL_HINT:-1}" = "1" ] || return 0
+    local word
+    word=$(_cu_pace_heavy_word "${1:-}")
+    [ -n "$word" ] || return 0
+    case "${_CU_PACE_LEVEL:-}" in
+        crit) printf '%s⚠ %s: try %s%s' "$(cu_color "$CU_RED")" "$word" "$CU_PACE_LIGHT_MODEL" "$(cu_reset)" ;;
+        warn) printf '%s→ %s%s' "$(cu_color "$CU_DIM")" "$CU_PACE_LIGHT_MODEL" "$(cu_reset)" ;;
+    esac
+}
+
+# Single-line segment: " | pace: <overshoot> [hint]". Uses the values of the
+# last cu_pace_load; nothing when it found none.
 cu_pace_render_inline() {
-    cu_pace_load "$@" || return 0
+    [ -n "${_CU_PACE_TARGET:-}" ] && [ "$CU_PACE_ROW" != "0" ] || return 0
+    local hint
+    hint=$(cu_pace_model_hint "${1:-}")
     printf " %s|%s %space:%s %s" \
         "$(cu_color "$CU_DIM")" "$(cu_reset)" \
         "$(cu_color "${CU_COLOR_LABEL:-$CU_DIM}")" "$(cu_reset)" \
         "$(cu_pace_fmt_overshoot)"
+    [ -n "$hint" ] && printf ' %s' "$hint"
+    return 0
 }
 
-# Multi-line row: "\npa <bar>  <overshoot>", aligned with the 5h/7d rows.
+# Multi-line row: "\npa <bar>  <overshoot> [hint]". CU_PACE_ROW=auto shows it
+# only when the usage is at least 1 point over the curve or a hint applies;
+# the target marker on the 7d bar carries the rest.
 cu_pace_render_multiline() {
-    cu_pace_load "$@" || return 0
+    [ -n "${_CU_PACE_TARGET:-}" ] && [ "$CU_PACE_ROW" != "0" ] || return 0
+    local hint
+    hint=$(cu_pace_model_hint "${1:-}")
+    if [ "$CU_PACE_ROW" = "auto" ] && [ -z "$hint" ] && [ "${_CU_PACE_O10:-0}" -lt 10 ]; then
+        return 0
+    fi
     printf "\n%spa%s %s  %s" \
         "$(cu_color "${CU_COLOR_LABEL:-$CU_DIM}")" "$(cu_reset)" \
         "$(cu_pace_bar)" \
         "$(cu_pace_fmt_overshoot)"
+    [ -n "$hint" ] && printf ' %s' "$hint"
+    return 0
 }

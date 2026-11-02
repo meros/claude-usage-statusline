@@ -21,7 +21,14 @@ cu_view_statusline() {
     cu_log "statusline: stdin ${#input} bytes"
 
     local cwd cwd_basename git_branch="" task_desc task_progress
-    cwd=$(echo "$input" | jq -r '.workspace.current_dir // empty' 2>/dev/null)
+    # The model of this session, for the pacing hint: "<id> <display name>".
+    _cu_model=""
+    local _model_id _model_name
+    IFS=$'\x1f' read -r cwd _model_id _model_name < <(echo "$input" \
+        | jq -r '[.workspace.current_dir // "", .model.id // "", .model.display_name // ""] | join("\u001f")' \
+        2>/dev/null) || true
+    _cu_model="${_model_id} ${_model_name}"
+    _CU_MODEL_ID="${_model_id:-$_model_name}"
     cwd_basename=$(basename "${cwd:-.}")
     [ -n "$cwd" ] && git_branch=$(git -C "$cwd" branch --show-current 2>/dev/null || true)
     cu_task_info
@@ -34,6 +41,10 @@ cu_view_statusline() {
     else
         _cu_statusline_load_usage "$input"
     fi
+
+    # Pacing: the target marker on the 7d bar and the pa row use it.
+    _CU_SEVEN_BEFORE_RESET=""
+    [ -n "$data" ] && [ -z "$cache_error" ] && cu_pace_load "$seven_pct" "$seven_reset" || true
 
     cu_update_check_bg
 
@@ -116,13 +127,24 @@ _cu_load_window() {
     esac
     [ -n "$_win_pct" ] || return 1
     cu_window_eta "$_win_field" "$_win_avg" "$_win_pct" "$_win_reset"
+    if [ "$_win_field" = "seven_day" ]; then
+        # A projected cap hit before the reset raises the pacing level.
+        _CU_SEVEN_BEFORE_RESET="$_before_reset"
+        [ -n "${_CU_PACE_TARGET:-}" ] && cu_pace_classify "$_before_reset"
+    fi
+    return 0
 }
 
 # --- Modules ---------------------------------------------------------------
 # Each renders one piece of the loaded window; empty output hides it.
 
+# The 7d bar carries the pacing target as a "│" marker.
 _cu_mod_bar() {
-    cu_progress_bar "$_win_pct" "$CU_BAR_WIDTH"
+    if [ "$_win_field" = "seven_day" ] && [ -n "${_CU_PACE_TARGET:-}" ]; then
+        cu_progress_bar "$_win_pct" "$CU_BAR_WIDTH" "" "$_CU_PACE_TARGET" "${_CU_PACE_COLOR:-}"
+    else
+        cu_progress_bar "$_win_pct" "$CU_BAR_WIDTH"
+    fi
 }
 
 _cu_mod_pct() {
@@ -221,7 +243,7 @@ _cu_statusline_single() {
     printf '%s' "$line"
 
     [ "$_cache_stale" = "1" ] && printf ' %s' "$(_cu_stale_detail)"
-    cu_pace_render_inline "$seven_pct" "$seven_reset"
+    cu_pace_render_inline "$_cu_model"
     local update_msg
     update_msg=$(cu_update_message)
     [ -n "$update_msg" ] && printf ' %s' "$update_msg"
@@ -301,7 +323,7 @@ _cu_statusline_multiline() {
     done
 
     [ "$_cache_stale" = "1" ] && printf ' %s' "$(_cu_stale_detail)"
-    cu_pace_render_multiline "$seven_pct" "$seven_reset"
+    cu_pace_render_multiline "$_cu_model"
     local update_msg
     update_msg=$(cu_update_message)
     [ -n "$update_msg" ] && printf '\n%s' "$update_msg"

@@ -41,7 +41,8 @@ Reading the rows, left to right:
 | rate | `10%/1h` | Usage burned in the last hour (5h) or day (7d). Red when the projection hits 100% before the reset. |
 | ETA | `~7h 24m` | When you reach 100% at the current pace: a duration for 5h, a day and hour for 7d. Green when it is well after the reset, yellow when close, red before it. Hidden when you will not reach 100% before the reset. |
 | reset | `↻ 1h 20m` | When the window resets. |
-| `pa` row | `-2% under` | [Pacing](#pacing-the-work-week): 7-day usage against an even spread over your work week. |
+| `│` on the 7d bar | `██████░│░░` | [Pacing](#pacing-the-work-week): where 7-day usage should be now, as an even spread over your work week. |
+| `pa` row | `+12 pts over ⚠ opus: try sonnet` | Appears when usage is 1 point or more over that target, or on a heavy model over the target. |
 
 The first line shows the directory, the git branch and, if you use it, a
 [task label](#task-label) for the Claude session.
@@ -205,10 +206,26 @@ target = 100% × (work hours of this week already passed / work hours per week)
 ```
 
 With the default Monday-Friday 07-16, the target rises 2.2 points per work
-hour and stays flat at night and on the weekend. `+12% over` means you are 12
-points ahead of that curve; the bar fills at `CU_PACE_BAR_SCALE` (30) points
-over. Set your own week with `CU_PACE_WORK_DAYS` and `CU_PACE_WORK_HOURS`, or
-turn the row off with `CU_PACE_ENABLED=0`.
+hour and stays flat at night and on the weekend. The `│` marker on the 7d bar
+shows the target. A marker right of the fill means you are under it.
+
+The `pa` row (CU_PACE_ROW=auto) appears when you are 1 point or more over the
+target: `+12 pts over` (the points are percentage points of the weekly cap).
+It is yellow up to 10 points over and red above that. It is also red at any
+overshoot when the 7d projection reaches 100% before the reset. The bar fills
+at `CU_PACE_BAR_SCALE` (30) points over.
+
+**Model hint.** The statusline reads the model of its own session. On a heavy
+model (`CU_PACE_HEAVY_MODELS`, default `opus fable`) it adds advice to the row:
+`→ sonnet` (dim) at 1 to 10 points over, `⚠ opus: try sonnet` (red) when the
+level is red. It does not see other sessions and cannot change the model.
+`CU_PACE_MODEL_HINT=0` turns it off. Each history record also stores the
+model id, for a later comparison of the burn rate per model.
+
+Set your own week with `CU_PACE_WORK_DAYS` and `CU_PACE_WORK_HOURS`, mark days
+off with `CU_PACE_OFF_DATES`, or keep a safety margin with
+`CU_PACE_TARGET_MAX=90` (the target reaches 90% at the reset). Turn the row
+off with `CU_PACE_ROW=0` and all pacing with `CU_PACE_ENABLED=0`.
 
 ### Task label
 
@@ -261,6 +278,12 @@ Defaults: `pct,sparkline,rate,eta,reset` (single-line) and
 | `CU_PACE_WORK_DAYS` | `mon-fri` | Work days: `mon-thu`, `mon,wed,fri`, `1-5` (1 = Monday), ranges wrap (`sun-thu`) |
 | `CU_PACE_WORK_HOURS` | `07-16` | Local work hours, `start-end`, end excluded |
 | `CU_PACE_BAR_SCALE` | `30` | Points over target that fill the pacing bar |
+| `CU_PACE_TARGET_MAX` | `100` | Usage the target reaches at the reset (`90` keeps a margin) |
+| `CU_PACE_OFF_DATES` | | Days off, `2026-12-24,2026-12-25`; they hold no work hours |
+| `CU_PACE_ROW` | `auto` | `auto` shows the `pa` row when over the target or a hint applies, `1` always, `0` never |
+| `CU_PACE_MODEL_HINT` | `1` | `0` turns off the model advice |
+| `CU_PACE_HEAVY_MODELS` | `opus fable` | Words that mark a heavy model in its id or name |
+| `CU_PACE_LIGHT_MODEL` | `sonnet` | The model the hint suggests |
 | `CU_PACE_CONTRACT_PATH` | `~/.cache/claude-pacing/statusline.json` | Pacing from an external tool (`{"util", "target", "updated_at"}`), read only when no usage data exists |
 
 ### Colors

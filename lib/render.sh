@@ -195,9 +195,10 @@ cu_sparkline_from_history() {
 }
 
 # Progress bar: PCT of WIDTH cells filled. COLOR defaults to the percentage
-# color (green/yellow/red).
+# color (green/yellow/red). With MARK (a percentage above 0) one cell shows a
+# "│" marker in MARK_COLOR at that position, for example the pacing target.
 cu_progress_bar() {
-    local pct="${1:-0}" width="${2:-20}" color="${3:-}"
+    local pct="${1:-0}" width="${2:-20}" color="${3:-}" mark="${4:-}" mark_color="${5:-}"
     pct="${pct%.*}"
     pct="${pct:-0}"
     [ "$pct" -gt 100 ] && pct=100
@@ -205,11 +206,29 @@ cu_progress_bar() {
     [ -z "$color" ] && color=$(cu_pct_color "$pct")
 
     local filled=$(( (pct * width) / 100 ))
-    local bar="" i
-    bar+="$(cu_color "$color")"
-    for ((i = 0; i < filled; i++)); do bar+="█"; done
-    bar+="$(cu_color "$CU_DIM")"
-    for ((i = filled; i < width; i++)); do bar+="░"; done
+    local mark_cell=-1
+    mark="${mark%.*}"
+    if [[ "$mark" =~ ^[0-9]+$ ]] && [ "$mark" -gt 0 ]; then
+        [ "$mark" -gt 100 ] && mark=100
+        mark_cell=$(( (mark * width) / 100 ))
+        [ "$mark_cell" -ge "$width" ] && mark_cell=$((width - 1))
+    fi
+    # One color code per run of equal cells, as the output stays short.
+    local bar="" i cell cell_color cur=""
+    for ((i = 0; i < width; i++)); do
+        if [ "$i" -eq "$mark_cell" ]; then
+            cell="│"; cell_color="${mark_color:-$CU_DIM}"
+        elif [ "$i" -lt "$filled" ]; then
+            cell="█"; cell_color="$color"
+        else
+            cell="░"; cell_color="$CU_DIM"
+        fi
+        if [ "$cell_color" != "$cur" ]; then
+            bar+="$(cu_color "$cell_color")"
+            cur="$cell_color"
+        fi
+        bar+="$cell"
+    done
     bar+="$(cu_reset)"
     printf '%s' "$bar"
 }

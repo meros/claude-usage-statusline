@@ -95,6 +95,10 @@ snap statusline-no-header CU_HEADER_MODULES= -- statusline --multiline
 snap statusline-no-header-single CU_HEADER_MODULES= -- statusline
 snap statusline-pace-off CU_PACE_ENABLED=0 -- statusline --multiline
 snap statusline-pace-weekdays CU_PACE_WORK_DAYS=mon-thu CU_PACE_WORK_HOURS=09-17 -- statusline --multiline
+snap statusline-pace-crit-opus CU_PACE_TARGET_MAX=40 -- statusline --multiline
+snap statusline-pace-crit-single CU_PACE_TARGET_MAX=40 -- statusline
+snap statusline-pace-row CU_PACE_ROW=1 -- statusline --multiline
+snap statusline-pace-no-hint CU_PACE_TARGET_MAX=40 CU_PACE_MODEL_HINT=0 -- statusline --multiline
 snap statusline-flat-eta CU_ETA_TEMPLATE=0 -- statusline --multiline
 snap statusline-thresholds CU_PCT_WARN=20 CU_PCT_CRIT=60 -- statusline --multiline
 SNAP_SETUP=task_state snap statusline-task CU_TASK_PID=4242 'CU_TASK_STATE_DIR=$HOME/state' -- statusline --multiline

@@ -7,7 +7,9 @@
 # Long tier:  one record per hour, kept 1 year, seven_day only. Feeds the 7d
 #             sparkline and the seasonal ETA template.
 #
-# Record format: {"ts": <epoch>, "five_hour": {"util": N, "resets_at": "<iso>"}, "seven_day": {...}}
+# Record format: {"ts": <epoch>, "model": "<id>", "five_hour": {"util": N, "resets_at": "<iso>"}, "seven_day": {...}}
+# "model" is the model of the session that wrote the record, when known. It
+# lets a later analysis compare the burn rate per model.
 
 CU_SHORT_INTERVAL=300        # 5 minutes
 CU_SHORT_MAX_AGE=129600      # 36 hours
@@ -64,14 +66,17 @@ cu_history_record() {
     local now lines short_line="" long_line=""
     now=$(cu_now)
     # Line 1: short-tier record, line 2: long-tier record ("null" = none)
-    lines=$(echo "$data" | jq -c --argjson ts "$now" '
+    lines=$(echo "$data" | jq -c --argjson ts "$now" --arg model "${_CU_MODEL_ID:-}" '
         def rec: {util: .utilization, resets_at: (.resets_at // "")};
         (if (.five_hour or .seven_day) then
             {ts: $ts}
+            + (if $model != "" then {model: $model} else {} end)
             + (if .five_hour then {five_hour: (.five_hour | rec)} else {} end)
             + (if .seven_day then {seven_day: (.seven_day | rec)} else {} end)
         else null end),
-        (if .seven_day then {ts: $ts, seven_day: (.seven_day | rec)} else null end)' 2>/dev/null) || true
+        (if .seven_day then {ts: $ts}
+            + (if $model != "" then {model: $model} else {} end)
+            + {seven_day: (.seven_day | rec)} else null end)' 2>/dev/null) || true
     { read -r short_line; read -r long_line; } <<< "$lines" || true
 
     _cu_history_append "$CU_HISTORY_SHORT" "$CU_SHORT_INTERVAL" "$now" "$short_line"
