@@ -265,13 +265,13 @@ _cu_statusline_multiline() {
         local _win_field _win_pct _win_reset _win_avg _win_label _win_title _win_spark_hours _win_tier
         local _eta_rate _eta_secs _before_reset
         cu_window_config "$win" || continue
+        # A window without data (for example a 5h limit that no longer
+        # exists) gets no row.
+        _cu_load_window "$win" || continue
         labels[row]="$_win_label"
-        local have_data=1
-        _cu_load_window "$win" || have_data=0
         for (( mi = 0; mi < num_mods; mi++ )); do
             idx=$(( row * num_mods + mi ))
-            out=""
-            [ "$have_data" = "1" ] && out=$(_cu_render_module "${mods[$mi]}")
+            out=$(_cu_render_module "${mods[$mi]}")
             w=0
             [ -n "$out" ] && w=$(cu_visible_len "$out")
             cells[idx]="$out"
